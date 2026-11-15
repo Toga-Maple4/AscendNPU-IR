@@ -1,0 +1,1 @@
+// RUN: python3 %S/Inputs/check_handoff.py bishengir-opt %S/l1-prefetch-ps-analysis.mlir %S/l1-prefetch-ps-nested.mlir %S/l1-prefetch-ps-static-columns.mlir %S/Inputs/recovered_gelu.mlir %S/Inputs/recovered_silu.mlir

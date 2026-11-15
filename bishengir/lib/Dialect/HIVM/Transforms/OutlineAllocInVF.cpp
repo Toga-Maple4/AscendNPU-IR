@@ -9,6 +9,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
 #include "bishengir/Dialect/HIVM/Utils/RegbaseUtils.h"
+#include "bishengir/Dialect/HIVM/Utils/UBPlanReleaseUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/PatternMatch.h"
@@ -70,6 +71,9 @@ void OutlineAllocInVFPass::runOnOperation() {
           SmallVector<Value> operands(callOp->getOperands().begin(),
                                       callOp->getOperands().end());
           rewriter.setInsertionPoint(callOp);
+          if (!operands.empty())
+            hivm::ensureUBPlanReleaseMarkBefore(rewriter, callOp,
+                                                operands.front());
           Value outlinedAllocOp =
               rewriter.create<memref::AllocOp>(allocOp->getLoc(), memRefType);
           operands.push_back(outlinedAllocOp);

@@ -1538,4 +1538,12 @@ def HIVM_Inserted_Load : HIVM_Attr<"kInsertedLoad", "inserted-load"> {}
 def HIVM_Inserted_Store : HIVM_Attr<"kInsertedStore", "inserted-store"> {}
 def HIVM_Inserted_Fixpipe : HIVM_Attr<"kInsertedFixpipe", "inserted-fixpipe"> {}
 
+def HIVM_UBPlanReleaseAttr : HIVM_Attr<"UBPlanRelease", "ub_plan_release"> {
+  let description = [{
+    PlanMemory-only hint: the marked UB memref (or its alloc root) may be
+    reused after this program point. Emitted by bl.dealloc / LowerUBPlanRelease;
+    preserved through VF merge and honored by PlanMemory; erased before codegen.
+  }];
+}
+
 #endif // BISHENGIR_DIALECT_HIVM_IR_HIVMATTRS_TD

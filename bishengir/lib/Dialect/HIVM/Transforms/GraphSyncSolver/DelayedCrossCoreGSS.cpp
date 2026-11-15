@@ -1132,6 +1132,9 @@ void DelayedCrossCoreGSSPass::eraseOldIntraBlockSyncOps(func::FuncOp funcOp) {
 
 void DelayedCrossCoreGSSPass::runOnOperation() {
   ModuleOp mod = getOperation();
+  for (auto func : mod.getOps<func::FuncOp>())
+    if (failed(validateSyncMemoryReadIds(func)))
+      return signalPassFailure();
   [[maybe_unused]] bool isMemBasedArch = hacc::utils::isMemBasedArch(mod);
   [[maybe_unused]] bool isRegBasedArch = hacc::utils::isRegBasedArch(mod);
   assert(isMemBasedArch != isRegBasedArch);

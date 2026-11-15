@@ -27,6 +27,7 @@ include "bishengir/Dialect/HIVM/IR/HIVMBase.td"
 include "bishengir/Dialect/HIVM/IR/HIVMAttrs.td"
 include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.td"
 include "bishengir/Dialect/HIVM/IR/HIVMTraits.td"
+include "bishengir/Dialect/HIVM/Interfaces/OpLayoutInterface.td"
 
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -435,16 +436,20 @@ def NZ2NDOp : HIVM_DmaOp<"nz2nd",
 def L12UBOp : HIVM_DmaOp<"l12ub",
     [StaticMaxRankTrait<2>,
      SinglePipeOpTrait, OpPipeTrait<"PIPE::PIPE_MTE1">,
-     HIVMCoreTypeInterface, CubeCoreTypeTrait
+     HIVMCoreTypeInterface, CubeCoreTypeTrait,
+     DeclareOpInterfaceMethods<OpLayoutInterface,
+       ["getOperandsTargetLayout", "getOperandsCurrentLayout"]>
     ]> {
   let summary = "HIVM data copy operation from L1 to UB Memory with NZ2ND conversion";
   let description = [{ NZ2ND does data movement from L1 to UB with NZ2ND conversion. }];
-  let arguments = (ins TensorOrMemref:$src, TensorOrMemref:$dst);
+  let arguments = (ins TensorOrMemref:$src, TensorOrMemref:$dst,
+      DefaultValuedOptionalAttr<BoolAttr, "false">:$sub_blockid);
   let results = (outs Optional<AnyRankedTensor>:$result_tensor);
   let assemblyFormat = [{
     attr-dict
     `ins` `(` $src `:` type($src) `)`
     `outs` `(` $dst `:` type($dst) `)`
+    (`sub_blockid` `=` $sub_blockid^ )?
     (`->` type($result_tensor)^)?
   }];
   let extraClassDeclaration = DmaOpBaseDecl;

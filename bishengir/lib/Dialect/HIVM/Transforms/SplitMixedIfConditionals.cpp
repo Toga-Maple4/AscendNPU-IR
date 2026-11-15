@@ -40,6 +40,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+#include "bishengir/Dialect/HIVM/Transforms/TightlyCoupledBufferUtils.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/Utils/WorklistBuilder.h"
 #include "bishengir/Dialect/Utils/Util.h"
@@ -365,6 +366,20 @@ struct SplitMixedIfConditionalsPattern : public OpRewritePattern<scf::IfOp> {
     // Stage C first so already-uniform ifs never enter A/B.
     if (succeeded(tryTagUniformCore(op, rewriter)))
       return success();
+    // A shared allocation inside the conditional must keep one region on
+    // both cores. Per-core partitioning would turn its tensor view into an
+    // escaping result with a synthetic empty inactive value, disconnecting
+    // the vector consumer from the cube's tightly coupled UB storage.
+    // SplitMixKernel can filter core-specific operations inside the original
+    // mixed conditional without changing that shared allocation or its scope.
+    bool containsSharedAllocation = false;
+    op.walk([&](memref::AllocOp alloc) {
+      containsSharedAllocation |=
+          getTightlyCoupledMark(alloc.getResult()).has_value();
+    });
+    if (containsSharedAllocation)
+      return failure();
+
     if (succeeded(tryBranchSplit(op, rewriter)))
       return success();
     return tryCoreSplit(op, rewriter);

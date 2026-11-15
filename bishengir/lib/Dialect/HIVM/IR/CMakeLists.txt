@@ -45,6 +45,7 @@ add_bishengir_dialect_library(BiShengIRHIVMDialect
   HIVMVectorOps.cpp
   StoreLikeOpInterface.cpp
   ../Utils/Utils.cpp
+  ../Utils/UBPlanReleaseUtils.cpp
   ../Utils/RegbaseUtils.cpp
   ../Utils/MultiBufferLoopAdapter.cpp
   ../Utils/WorklistBuilder.cpp

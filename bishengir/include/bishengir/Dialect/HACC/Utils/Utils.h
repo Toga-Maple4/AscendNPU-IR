@@ -128,6 +128,13 @@ SmallVector<ExternalFuncInfo> collectExternalFuncs(ModuleOp mod);
 /// Get NPU target specification from module.
 std::optional<HACCTargetDeviceSpecInterface> getNPUTargetSpec(ModuleOp op);
 
+/// Query the generated target specification without mutating a module.
+HACCTargetDeviceSpecInterface getNPUTargetSpecAttr(MLIRContext *context,
+                                                 TargetDevice target,
+                                                 Location loc,
+                                                 int32_t customAICNumber = -1,
+                                                 int32_t customAIVNumber = -1);
+
 /// Set NPU target specification to module.
 void setNPUTargetSpec(ModuleOp op, HACCTargetDeviceSpecInterface spec);
 

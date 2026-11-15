@@ -13,6 +13,11 @@
 
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/HIVM/Transforms/L1PrefetchPS.h"
+#include "bishengir/Dialect/HIVM/Transforms/SelectedCapacity.h"
+#include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+#include "bishengir/Tools/RetriablePassManager/RetriablePassManager.h"
+#include "llvm/Support/JSON.h"
 #include "bishengir/Tools/hivmc/Config.h"
 #include "bishengir/Tools/hivmc/HIVMC.h"
 #include "bishengir/Tools/hivmc/HIVMCA5.h"
@@ -328,9 +333,8 @@ HIVMCMainConfig HIVMCFromBiShengIRConfig(BiShengIRCompileMainConfig& config) {
 
 } // namespace
 
-LogicalResult
-bishengir::regbase::runRegBasePipeline(ModuleOp mod,
-                                       BiShengIRCompileMainConfig config) {
+static LogicalResult
+runOrdinaryRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig &config) {
   if (failed(checkInOutOptionsValidity(config))) {
     return failure();
   }
@@ -461,4 +465,345 @@ bishengir::regbase::runRegBasePipeline(ModuleOp mod,
   }
 
   return success();
+}
+
+// New-L1 uses the active A5 lowering stages. The unrequested ordinary path
+// below retains Maple4's existing orchestration and fallback behavior.
+static LogicalResult
+runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) {
+  MLIRContext *ctx = mod->getContext();
+  auto &diagEngine = ctx->getDiagEngine();
+  std::vector<std::unique_ptr<Diagnostic>> collectedDiagnostics;
+  // Ordinary fallback tuning must not change the separate retry configuration.
+  const BiShengIRCompileMainConfig requestedConfig = config;
+  const bool requestProgramSplit = config.getEnableProgramSplitMix();
+  const bool effectiveAutoMultiBuffer = config.getEnableAutoMultiBuffer();
+  // The first attempt always uses the ordinary kernel schedule. The option
+  // selects the separate blockifier only on a proved capacity retry.
+  if (requestProgramSplit)
+    config.setEnableProgramSplitMix(false);
+  const std::string splitResultPath =
+      config.getOutputFile() + ".program_split.json";
+  if (requestProgramSplit)
+    (void)llvm::sys::fs::remove(splitResultPath);
+  bool acceptedProgramSplit = false;
+  bool candidateAccepted = false;
+  OwningOpRef<ModuleOp> candidateModule;
+  DictionaryAttr candidateRuntimeContract;
+  DictionaryAttr candidateExternalContract;
+  StringAttr candidateProof;
+  std::string candidateReason = "not_requested";
+  const std::string programSplitTarget =
+      hacc::stringifyTargetDeviceEnum(config.getTarget()).str();
+  const bool supportedProgramSplitTarget =
+      hacc::utils::isAscend950(programSplitTarget);
+  if (requestProgramSplit) {
+    if (!effectiveAutoMultiBuffer) {
+      candidateReason = "multibuffer_off";
+    } else if (!supportedProgramSplitTarget) {
+      candidateReason = "unsupported_target";
+    } else {
+      candidateModule = OwningOpRef<ModuleOp>(mod.clone());
+      if (failed(runPipeline(*candidateModule,
+          [](mlir::PassManager &pm) {
+            pm.addPass(hivm::createL1PrefetchPSAnalysisPass());
+          }, config, "L1-semantic-analysis")))
+        return failure();
+      auto entry = hivm::getL1PrefetchPSEntry(*candidateModule);
+      if (!entry) {
+        candidateReason = "multiple_or_missing_functions";
+      } else {
+        candidateAccepted = entry->hasAttr("l1_prefetch_ps.accepted");
+        if (candidateAccepted) {
+          std::string interfaceReason;
+          auto targetSpec = hacc::utils::getNPUTargetSpecAttr(
+              entry.getContext(), requestedConfig.getTarget(), entry.getLoc());
+          auto contract = hivm::getL1PrefetchPSLaunchContract(
+              entry, targetSpec, interfaceReason);
+          if (failed(contract)) {
+            if (interfaceReason.empty()) return failure();
+            if (interfaceReason != "l1_reservation_exceeds_capacity") {
+              entry.emitError("L1 pipeline error: ") << interfaceReason;
+              return failure();
+            }
+            candidateAccepted = false;
+            candidateReason = interfaceReason;
+          } else {
+            candidateRuntimeContract = *contract;
+            auto external = hivm::getL1PrefetchPSExternalContract(entry);
+            if (failed(external)) {
+              entry.emitError("could not derive the accepted external launch contract");
+              return failure();
+            }
+            candidateExternalContract = *external;
+            candidateProof = entry->getAttrOfType<StringAttr>("l1_prefetch_ps.proof");
+            candidateReason = "accepted";
+          }
+        } else {
+          auto reason = entry->getAttrOfType<StringAttr>("l1_prefetch_ps.reject_reason");
+          if (!reason) {
+            entry.emitError("L1 pipeline error: semantic analysis produced no outcome");
+            return failure();
+          }
+          candidateReason = reason.getValue().str();
+        }
+      }
+    }
+  }
+
+  if (requestProgramSplit && !candidateAccepted) {
+    llvm::errs() << "[program-split] reject: " << candidateReason << "\n";
+    if (candidateReason == "preexisting_program_split_plan") {
+      mod.emitError("L1 pipeline error: source-supplied split plan is not trusted");
+      return failure();
+    }
+  }
+
+  auto writeProgramSplitResult = [&]() -> LogicalResult {
+    if (requestProgramSplit) {
+      std::error_code ec;
+      llvm::raw_fd_ostream result(splitResultPath, ec, llvm::sys::fs::OF_Text);
+      if (ec) {
+        mod.emitError("could not write program-split compile result");
+        return failure();
+      }
+      llvm::json::OStream json(result);
+      json.object([&] {
+        json.attribute("schema_version", 2);
+        json.attribute("kind", acceptedProgramSplit ? "split_mix_half_grid" : "ordinary");
+        if (acceptedProgramSplit) {
+          // One serializer for all runtime contract kinds. Physical realization
+          // continues to consume its internal dictionary, never this sidecar.
+          std::function<void(mlir::Attribute)> writeValue = [&](mlir::Attribute value) {
+            if (auto boolean = dyn_cast<BoolAttr>(value))
+              json.value(boolean.getValue());
+            else if (auto integer = dyn_cast<IntegerAttr>(value))
+              json.value(integer.getInt());
+            else if (auto string = dyn_cast<StringAttr>(value))
+              json.value(string.getValue());
+            else if (auto array = dyn_cast<ArrayAttr>(value)) {
+              json.array([&] {
+                for (mlir::Attribute item : array)
+                  writeValue(item);
+              });
+            } else if (auto dictionary = dyn_cast<DictionaryAttr>(value)) {
+              json.object([&] {
+                for (NamedAttribute item : dictionary) {
+                  json.attributeBegin(item.getName().strref());
+                  writeValue(item.getValue());
+                  json.attributeEnd();
+                }
+              });
+            } else {
+              llvm::report_fatal_error(
+                  "unsupported external program-split attribute");
+            }
+          };
+          for (NamedAttribute item : candidateExternalContract) {
+            json.attributeBegin(item.getName().strref());
+            writeValue(item.getValue());
+            json.attributeEnd();
+          }
+          json.attribute("target", programSplitTarget);
+        } else {
+          json.attribute("reason", candidateAccepted ? "ordinary_compiled" : candidateReason);
+        }
+        json.attributeObject("compile_options", [&] {
+          json.attribute("enable_vf_fusion", config.getEnableVFFusion());
+          json.attribute("disable_vf_reachable_check", config.getDisableVFReachableCheck());
+          json.attribute("hfusion_max_buffer_count_tuning", config.getHfusionMaxBufferCountTuning());
+          json.attribute("enable_auto_multi_buffer", config.getEnableAutoMultiBuffer());
+        });
+      });
+      result << "\n";
+      result.close();
+      if (result.has_error()) {
+        mod.emitError("could not finish program-split compile result");
+        return failure();
+      }
+    }
+    return success();
+  };
+
+
+  auto handlerID = diagEngine.registerHandler([&](Diagnostic &diag) {
+    collectedDiagnostics.push_back(std::make_unique<Diagnostic>(std::move(diag)));
+  });
+  auto runHIRAttempt = [&](ModuleOp attempt, BiShengIRCompileMainConfig &options) {
+    switch (getCompileFlow(options)) {
+    case CompileFlow::Mixed:
+      return runMixedPipelines(attempt, options);
+    case CompileFlow::PureSimt:
+      return runModulePipeline(attempt, regbase::buildBiShengTTIRPipeline,
+                               options, "BiShengSIMT");
+    case CompileFlow::Simd:
+      return runModulePipeline(attempt, regbase::buildBiShengHIRPipeline,
+                               options, "BiShengHIR") &&
+             runModulePipeline(attempt, regbase::buildFinalHIVMPipelines,
+                               options, "buildFinalHIVMPipelines");
+    }
+    llvm_unreachable("unknown compile flow");
+  };
+  // A capacity-only failure is recoverable. Verifier, contract, lowering and
+  // tool errors must not be hidden by switching to a different schedule.
+  auto capacityOnlyFailure = [&](size_t start) {
+    bool capacity = false;
+    for (size_t i = start; i < collectedDiagnostics.size(); ++i) {
+      const Diagnostic &diag = *collectedDiagnostics[i];
+      if (diag.getSeverity() != mlir::DiagnosticSeverity::Error)
+        continue;
+      std::string message = diag.str();
+      StringRef text(message);
+      if (text == "L1 pipeline error: ping/pong reservation exceeds target L1 capacity") {
+        capacity = true;
+        continue;
+      }
+      if ((text.starts_with("ub overflow, requires ") ||
+           text.starts_with("cbuf overflow, requires ") ||
+           text.starts_with("l1 overflow, requires ")) &&
+          text.contains(" bits available!")) {
+        capacity = true;
+        continue;
+      }
+      // RetriablePassManager adds this wrapper after the originating error.
+      if (text.starts_with("Failed to run ") && text.contains(" pipeline"))
+        continue;
+      return false;
+    }
+    return capacity;
+  };
+  auto installResult = [&](OwningOpRef<ModuleOp> &attempt) {
+    (*attempt)->removeAttr("hivm.defer_memory_fallback");
+    mod.erase();
+    mod = attempt.release();
+    collectedDiagnostics.clear();
+  };
+
+  // true: compiled; false: an understood rejection permits ordinary fallback;
+  // failure: an unexpected compiler error that must remain visible.
+  auto tryBeforeMemoryFallback = [&]() -> FailureOr<bool> {
+    llvm::errs() << "[program-split] trying ordinary MB before memory fallback\n";
+    OwningOpRef<ModuleOp> ordinary(mod.clone());
+    (*ordinary)->setAttr("hivm.defer_memory_fallback", UnitAttr::get(ctx));
+    ordinary->walk([](func::FuncOp func) {
+      func->removeAttr("program_split.memory_result");
+    });
+    if (runHIRAttempt(*ordinary, config)) {
+      installResult(ordinary);
+      return true;
+    }
+    if (!capacityOnlyFailure(0))
+      return failure();
+    if (!candidateAccepted)
+      return false;
+
+    // Selection marks live only in a diagnostic clone: ordinary compilation
+    // is not changed by their effects on canonicalization or use counts.
+    size_t probeStart = collectedDiagnostics.size();
+    OwningOpRef<ModuleOp> probe(candidateModule->clone());
+    (*probe)->setAttr("hivm.defer_memory_fallback", UnitAttr::get(ctx));
+    bool probeSuccess = runHIRAttempt(*probe, config);
+    if (!probeSuccess && !capacityOnlyFailure(probeStart))
+      return failure();
+    bool provenSelectedExcess = false;
+    for (auto func : probe->getOps<func::FuncOp>()) {
+      auto result = func->getAttrOfType<DictionaryAttr>("program_split.memory_result");
+      auto proof = func->getAttrOfType<StringAttr>("l1_prefetch_ps.proof");
+      if (!result || proof != candidateProof)
+        continue;
+      if (failed(hivm::verifyL1PrefetchPSRealizationRoles(func, candidateRuntimeContract)))
+        return failure();
+      auto inputs = candidateRuntimeContract.getAs<DenseI32ArrayAttr>("input_args");
+      auto capacity = hivm::SelectedSetCapacity::decode(result, inputs.size());
+      auto kind = result.getAs<StringAttr>("kind");
+      if (kind && kind.getValue() == "proven_selected_set_capacity_excess" &&
+          capacity && capacity->hasMultipleSlots() && capacity->exceedsCapacity())
+        provenSelectedExcess = true;
+    }
+    collectedDiagnostics.resize(probeStart);
+    if (!provenSelectedExcess)
+      return false;
+
+    llvm::errs() << "[program-split] trying New-L1 after selected-capacity proof\n";
+    BiShengIRCompileMainConfig splitConfig = requestedConfig;
+    splitConfig.setEnableProgramSplitMix(true);
+    splitConfig.setEnableAutoMultiBuffer(false);
+    splitConfig.setEnableMixedCV(true);
+    splitConfig.setEnableAutoBindSubBlock(false);
+    RetriablePassManager splitPm(splitConfig, ctx);
+    OwningOpRef<ModuleOp> split(candidateModule->clone());
+    const size_t splitStart = collectedDiagnostics.size();
+    // A transform failure means an invalid/stale proof, not a capacity reject.
+    if (failed(splitPm.runOnce(*split, [](mlir::PassManager &pm) {
+          pm.addPass(hivm::createL1PrefetchPSTransformPass());
+        }, "L1-transform")))
+      return failure();
+    // The acceptance fingerprint binds module attributes: add the physical
+    // retry budget only after the transform has consumed the unchanged proof.
+    (*split)->setAttr("hivm.defer_memory_fallback",
+                     IntegerAttr::get(mlir::IntegerType::get(ctx, 32), 20));
+    if (!runHIRAttempt(*split, splitConfig)) {
+      if (!capacityOnlyFailure(splitStart))
+        return failure();
+      llvm::errs() << "[program-split] physical capacity rejection; "
+                      "continuing ordinary memory fallback\n";
+      return false;
+    }
+    installResult(split);
+    config = splitConfig;
+    acceptedProgramSplit = true;
+    return true;
+  };
+
+
+  FailureOr<bool> initial = false;
+  if (effectiveAutoMultiBuffer && supportedProgramSplitTarget)
+    initial = tryBeforeMemoryFallback();
+  diagEngine.eraseHandler(handlerID);
+  if (failed(initial)) {
+    for (auto &diag : llvm::reverse(collectedDiagnostics))
+      diagEngine.emit(std::move(*diag));
+    return failure();
+  }
+  if (!*initial) {
+    // No probe or rejected split IR is reused by the ordinary fallback.
+    if (effectiveAutoMultiBuffer && supportedProgramSplitTarget) {
+      config.setEnableAutoMultiBuffer(false);
+      RetriablePassManager::emitFallbackNote(
+          "capacity rejection after New-L1 opportunity",
+          "enable-auto-multi-buffer", "false");
+    }
+    if (failed(runOrdinaryRegBasePipeline(mod, config)))
+      return failure();
+    return writeProgramSplitResult();
+  }
+
+  // Complete the accepted attempt using the same A5 code-generation stages
+  // and bitcode selection as ordinary compilation. Emit no sidecar on failure.
+  if (getCompileFlow(config) == CompileFlow::Simd &&
+      !runModulePipeline(mod, regbase::buildBiShengHIRAVEToLLVMPipeline,
+                         config, "BiShengSIMD"))
+    return failure();
+  addBitcodeAttrsToModule(mod, config.getExecutablePath(), config);
+  if (failed(handleSaveTemps(mod, config)))
+    return failure();
+  auto hivmcConfig = HIVMCFromBiShengIRConfig(config);
+  if (failed(runHIVMCCompileA5(mod, hivmcConfig)))
+    return failure();
+  if (config.shouldEnableCPURunner()) {
+    auto fileHandle = mlir::openOutputFile(config.getOutputFile());
+    if (!fileHandle)
+      return failure();
+    fileHandle->os() << mod << '\n';
+    fileHandle->keep();
+  }
+  return writeProgramSplitResult();
+}
+
+LogicalResult
+bishengir::regbase::runRegBasePipeline(ModuleOp mod,
+                                     BiShengIRCompileMainConfig config) {
+  if (config.getEnableProgramSplitMix())
+    return runProgramSplitRegBasePipeline(mod, config);
+  return runOrdinaryRegBasePipeline(mod, config);
 }

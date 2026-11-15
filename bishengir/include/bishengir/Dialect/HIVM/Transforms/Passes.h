@@ -63,6 +63,8 @@ namespace mlir {
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 
 namespace hivm {
+std::unique_ptr<Pass> createL1PrefetchPSAnalysisPass();
+std::unique_ptr<Pass> createL1PrefetchPSTransformPass();
 /// Create a pass to infer the core type of each function.
 std::unique_ptr<Pass> createInferFuncCoreTypePass();
 
@@ -181,6 +183,9 @@ std::unique_ptr<Pass> createAllocExtraBufferPass();
 
 /// Create a pass to outline memref.alloc with static shape in VF
 std::unique_ptr<Pass> createOutlineAllocInVFPass();
+
+/// Convert UB memref.dealloc to plan-only ub_plan_release marks.
+std::unique_ptr<Pass> createLowerUBPlanReleasePass();
 
 /// Create a pass to outline hivm.load in VF by rewriting it to hivm.copy.
 std::unique_ptr<Pass> createOutlineCopyInVFPass();
@@ -369,8 +374,12 @@ std::unique_ptr<Pass> createInsertNZ2NDForDebugPass();
 // Create a pass to insert l12ub for debug.
 std::unique_ptr<Pass> createInsertL12UBForDebugPass();
 
-/// Create a pass to loop on blocks when logical blocknum is larger than
-/// physical one
+/// Assign each MIX vector subcore one complete logical program.
+std::unique_ptr<Pass> createProgramSplitMixBlockifyPass();
+std::unique_ptr<Pass> createProgramSplitL1MaterializePass();
+std::unique_ptr<Pass> createProgramSplitL1FinalizeSyncPass();
+std::unique_ptr<Pass> createProgramSplitL1ConsumerSyncPass();
+/// Distribute parallel loop work across hardware blocks.
 std::unique_ptr<Pass> createAutoBlockifyParallelLoopPass();
 
 // Create CV pipelining pass

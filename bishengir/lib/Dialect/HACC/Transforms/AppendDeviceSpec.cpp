@@ -77,11 +77,13 @@ Attribute maybeOverrideSpecValue(ImplicitLocOpBuilder &builder,
   return builder.getI32IntegerAttr(newVal);
 }
 
-HACCTargetDeviceSpecInterface getNPUTargetSpecAttr(MLIRContext *context,
+} // namespace
+
+HACCTargetDeviceSpecInterface mlir::hacc::utils::getNPUTargetSpecAttr(MLIRContext *context,
                                                    TargetDevice target,
+                                                   Location loc,
                                                    int32_t customAICNumber,
-                                                   int32_t customAIVNumber,
-                                                   Location loc) {
+                                                   int32_t customAIVNumber) {
   auto maybeSpec = getTargetSpec(target);
   if (!maybeSpec.has_value() ||
       maybeSpec.value()->device == TargetDevice::Unknown)
@@ -110,8 +112,6 @@ HACCTargetDeviceSpecInterface getNPUTargetSpecAttr(MLIRContext *context,
   return cast<HACCTargetDeviceSpecInterface>(
       hacc::TargetDeviceSpecAttr::get(context, entries));
 }
-
-} // namespace
 
 void AppendDeviceSpec::runOnOperation() {
   ModuleOp moduleOp = getOperation();
@@ -146,8 +146,8 @@ void AppendDeviceSpec::runOnOperation() {
 
   MLIRContext *ctx = &getContext();
   hacc::utils::setTargetDevice(moduleOp, finalTarget);
-  auto targetSpec = getNPUTargetSpecAttr(ctx, finalTarget, customAICNumber,
-                                         customAIVNumber, moduleOp->getLoc());
+  auto targetSpec = hacc::utils::getNPUTargetSpecAttr(ctx, finalTarget, moduleOp->getLoc(),
+                                         customAICNumber, customAIVNumber);
   hacc::utils::setNPUTargetSpec(moduleOp, targetSpec);
 
   if (hacc::utils::isMemBasedArch(moduleOp)) {

@@ -50,6 +50,8 @@ config.suffixes = [
 config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
 config.substitutions.append(("%host_cxx", config.host_cxx))
+if shutil.which(config.host_cxx.strip()):
+    config.available_features.add("host-cxx")
 config.substitutions.append(("%host_cc", config.host_cc))
 config.substitutions.append(("%bishengir_src_root", config.bishengir_src_root))
 

@@ -86,6 +86,8 @@ void GraphSyncSolverPass::runOnOperation() {
   options.enableSiblingIfSync = this->enableSiblingIfSync;
   options.solverVersion = parseSyncSolverVersion(this->solverVersion);
 
+  if (failed(validateSyncMemoryReadIds(funcOp)))
+    return signalPassFailure();
   auto irTranslator = std::make_unique<IRTranslator>(funcOp, options);
 
   LLVM_DEBUG({

@@ -847,9 +847,16 @@ bool shouldApplyFlattenOpsPass(func::FuncOp func) {
   auto coreType = mlir::hivm::queryFuncCoreType(func);
   if (!coreType.has_value())
     return true;
-  // Don't apply flattening for pure AIC/AIV funcs.
-  return coreType.value() != mlir::hivm::TFuncCoreType::AIC &&
-         coreType.value() != mlir::hivm::TFuncCoreType::AIV;
+  if (coreType.value() == mlir::hivm::TFuncCoreType::AIC)
+    return false;
+  if (coreType.value() == mlir::hivm::TFuncCoreType::AIV) {
+    // New-L1 defers vectorization until after MIX splitting. Allow its vector
+    // consumer through both reshape propagation and flattening, retaining the
+    // passes' existing layout and control-flow legality checks.
+    return func->hasAttr(hivm::TPartOfMixAttr::name) &&
+           func->hasAttr("program_split.transformed");
+  }
+  return true;
 }
 
 /// trace value and judge if it is function argument

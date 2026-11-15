@@ -20,6 +20,7 @@
 #include "bishengir/Dialect/HIVM/Transforms/GraphSyncSolver/Utility.h"
 
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
@@ -52,7 +53,79 @@
 #define DEBUG_TYPE "hivm-gss-ir-translator"
 
 using namespace mlir;
+using hivm::kSyncMemoryReadId;
+using hivm::kSyncMemoryReadIds;
 using namespace hivm::syncsolver;
+
+namespace {
+// Accept the legacy scalar consumer spelling at the boundary. Both spellings
+// have the same validation and dependency semantics.
+FailureOr<SmallVector<int32_t>> readIds(Operation *op) {
+  bool plural = op->hasAttr(kSyncMemoryReadIds);
+  bool singular = op->hasAttr(kSyncMemoryReadId);
+  if (!plural && !singular)
+    return SmallVector<int32_t>{};
+  SmallVector<int32_t> result;
+  if (plural) {
+    auto ids = op->getAttrOfType<DenseI32ArrayAttr>(kSyncMemoryReadIds);
+    if (!ids || ids.empty() || singular || !isa<hivm::StoreOp>(op)) {
+      op->emitError("invalid plural sync-memory-read metadata");
+      return failure();
+    }
+    llvm::append_range(result, ids.asArrayRef());
+  } else {
+    auto id = op->getAttrOfType<IntegerAttr>(kSyncMemoryReadId);
+    if (!id || !id.getType().isInteger(32) || !isa<hivm::StoreOp>(op)) {
+      op->emitError("invalid singular sync-memory-read metadata");
+      return failure();
+    }
+    result.push_back(id.getInt());
+  }
+  return result;
+}
+} // namespace
+
+LogicalResult
+mlir::hivm::syncsolver::validateSyncMemoryReadIds(func::FuncOp func) {
+  DenseMap<int32_t, SmallVector<Value>> marks;
+  auto marked = func.walk([&](annotation::MarkOp mark) -> WalkResult {
+    if (!mark->hasAttr(kSyncMemoryReadId) && !mark->hasAttr(kSyncMemoryReadIds))
+      return WalkResult::advance();
+    auto id = mark->getAttrOfType<IntegerAttr>(kSyncMemoryReadId);
+    if (!id || !id.getType().isInteger(32) || id.getInt() < 0 ||
+        !isa<BaseMemRefType>(mark.getSrc().getType()) ||
+        mark->hasAttr(kSyncMemoryReadIds)) {
+      mark.emitError("invalid sync-memory buffer identity");
+      return WalkResult::interrupt();
+    }
+    marks[id.getInt()].push_back(mark.getSrc());
+    return WalkResult::advance();
+  });
+  if (marked.wasInterrupted())
+    return failure();
+  auto result = func.walk([&](Operation *op) -> WalkResult {
+    if (isa<annotation::MarkOp>(op))
+      return WalkResult::advance();
+    auto ids = readIds(op);
+    if (failed(ids))
+      return WalkResult::interrupt();
+    llvm::SmallDenseSet<int32_t, 2> seen;
+    llvm::SmallDenseSet<Value, 2> buffers;
+    for (int32_t id : *ids) {
+      auto found = marks.find(id);
+      if (id < 0 || !seen.insert(id).second || found == marks.end() ||
+          found->second.size() != 1 ||
+          !buffers.insert(found->second.front()).second) {
+        op->emitError(op->hasAttr(kSyncMemoryReadIds)
+                          ? "plural sync-memory-read IDs require unique marked buffers"
+                          : "singular sync-memory-read ID requires a unique marked buffer");
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
 
 // Resolve a Value into the underlying pointer-like Values used for memory
 // conflict analysis (handles block args, selects, scf::If, scf::For/While
@@ -655,6 +728,33 @@ IRTranslator::getDestinationStyleInterfaceOp(Operation *op,
     coreTypeVal = coreType.value();
   }
   auto [readMemOps, writeMemOps] = getReadWriteMemoryOps(op);
+  // Some asynchronous consumers keep an additional tightly coupled buffer
+  // busy even though it is not an SSA operand of the operation.  A matching
+  // id on the operation and an annotation.mark names that buffer without
+  // introducing physical synchronization into the IR.
+  if (options.isCrossCoreMode()) {
+    auto ids = readIds(op);
+    // All solver entry points validate before constructing translator IR.
+    assert(succeeded(ids) && "sync-memory-read metadata must be validated");
+    if (succeeded(ids) && !ids->empty()) {
+      auto function = op->getParentOfType<func::FuncOp>();
+      auto insertion = syncReadBuffers.try_emplace(function.getOperation());
+      auto entry = insertion.first;
+      if (insertion.second) {
+        function.walk([&](annotation::MarkOp mark) {
+          auto id = mark->getAttrOfType<IntegerAttr>(kSyncMemoryReadId);
+          if (id)
+            entry->second.try_emplace(id.getInt(), mark.getSrc());
+        });
+      }
+      for (int32_t id : *ids) {
+        Value buffer = entry->second.lookup(id);
+        assert(buffer && "sync-memory-read metadata must be validated");
+        if (buffer)
+          llvm::append_range(readMemOps, getMemoryOps({buffer}));
+      }
+    }
+  }
   std::optional<hivm::PIPE> pipe;
   if (options.isCrossCoreMode()) {
     if (isa<hivm::CopyOp, hivm::VBrcOp>(op) ||

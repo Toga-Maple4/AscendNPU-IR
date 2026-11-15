@@ -1,0 +1,2 @@
+# REQUIRES: host-cxx
+# RUN: %python %S/Inputs/check_gm_to_l1_grouped.py %S/../../lib/Template/lib/DMA/Cbuf/Copy2D.cpp %host_cxx

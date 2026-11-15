@@ -77,19 +77,26 @@ __aicore__ __attribute__((always_inline)) void load_gm_to_cbuf_intrin_core(
             dst_gap,                // dst_gap
             pad_t::PAD_NONE);       // pad_mode
 #else
-  INTRINSIC(copy_gm_to_cbuf_align_v2,
-            (__cbuf__ T *)cbuf_ptr + cbuf_offset, // dst_addr
-            (__gm__ T *)gm_ptr + gm_offset,     // src_addr
-            0,                      // sid
-            burst_cnt,              // burst_num
-            burst_len,              // burst_len
-            0,                      // left_padding_count
-            0,                      // right_padding_count
-            true,                   // data_select_bit
-            0,                      // l2_cache_ctl
-            src_gap + burst_len,    // burst_src_stride
-            dst_gap + burst_len     // burst_dst_stride
-            );
+  // A5 align-v2 geometry is byte-valued, while the pointer type selects the
+  // transfer data type. Preserve that type instead of turning a half transfer
+  // into a byte transfer.
+  if constexpr (std::is_same<T, bfloat16_t>::value) {
+    INTRINSIC(copy_gm_to_cbuf_align_v2,
+              reinterpret_cast<__cbuf__ __bf16 *>(cbuf_ptr + cbuf_offset),
+              reinterpret_cast<__gm__ __bf16 *>(gm_ptr + gm_offset), 0,
+              burst_cnt, burst_len, 0, 0, true, 0, src_gap + burst_len,
+              dst_gap + burst_len);
+  } else if constexpr (sizeof(T) == BYTES_B64) {
+    INTRINSIC(copy_gm_to_cbuf_align_v2,
+              reinterpret_cast<__cbuf__ uint32_t *>(cbuf_ptr + cbuf_offset),
+              reinterpret_cast<__gm__ uint32_t *>(gm_ptr + gm_offset), 0,
+              burst_cnt, burst_len, 0, 0, true, 0, src_gap + burst_len,
+              dst_gap + burst_len);
+  } else {
+    INTRINSIC(copy_gm_to_cbuf_align_v2, cbuf_ptr + cbuf_offset,
+              gm_ptr + gm_offset, 0, burst_cnt, burst_len, 0, 0, true, 0,
+              src_gap + burst_len, dst_gap + burst_len);
+  }
 #endif
 }
 
@@ -395,12 +402,14 @@ load_gm_to_ubuf_2d_core_with_contiguous_last_dim(memref_t<__gm__ T, 2> *gm,
   constexpr int32_t bytes = sizeof(T);
   const int64_t ub_gap = (stride0_ub - size1) * bytes;
   const int64_t gm_gap = (stride0_gm - size1) * bytes;
+bool requires_row_copy = false;
 #if defined(__DAV_C310__)
+  requires_row_copy = stride0_gm != size1 || stride0_ub != size1;
   bool is_over_gap = stride0_gm * bytes > INTRIN_MAX_STRIDE;
 #else
   bool is_over_gap = gm_gap > INTRIN_MAX_GAP;
 #endif
-  if (is_over_gap || 0 > ub_gap || 0 > stride0_gm - size1) [[unlikely]] {
+  if (requires_row_copy || is_over_gap || 0 > ub_gap || 0 > stride0_gm - size1) [[unlikely]] {
     // special cases of stride, unlikely used
     const int64_t size0 = gm->sizes[0];
     for (int64_t i = 0; i < size0; i++) {

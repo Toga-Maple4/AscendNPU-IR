@@ -25,6 +25,7 @@
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "bishengir/Dialect/HIVM/Transforms/OptMemPlanForPipeline.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+#include "bishengir/Dialect/HIVM/Transforms/SelectedCapacity.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/Analysis/Liveness.h"
@@ -385,10 +386,13 @@ protected:
                            hivm::AddressSpace bufferScope);
 
   /// Process gen buffer based on the result value of op.
-  void UpdateOpGenInfo(OpInfo *opInfo, const ValueRange &results);
+  void UpdateOpGenInfo(OpInfo *opInfo, const ValueRange &results,
+                       bool allowTcbufRevive = false);
 
   /// Update normal operand gen information on buffer.
-  void UpdateOperandGenInfo(OpInfo *opInfo, Value operand);
+  void UpdateOperandGenInfo(OpInfo *opInfo, Value operand,
+                            bool allowTcbufRevive = false);
+  void UpdateDeallocKillInfo(OpInfo *opInfo, Value memref);
 
   /// Update temp buffer for DestinationStyleOpInterface op.
   void UpdateOpTempGenInfo(OpInfo *opInfo);
@@ -558,6 +562,10 @@ MemPlanRegBase(MemPlanMode planMode, bool enableGlobalReuse,
         vfInplaceReuseInfo(nullptr) {}
 
   LogicalResult plan(bool emitErrors = true);
+  std::optional<SelectedBufferCapacity>
+  getSelectedBufferCapacity(Value selectedBuffer) const;
+  std::optional<SelectedSetCapacity>
+  getSelectedSetCapacity(ArrayRef<Value> selectedBuffers) const;
 
   /// Get buffer2Offsets
   inline DenseMap<Value, SmallVector<uint64_t>> GetBuffer2Offsets() {

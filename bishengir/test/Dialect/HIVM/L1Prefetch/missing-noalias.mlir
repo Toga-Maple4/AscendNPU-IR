@@ -1,0 +1,153 @@
+// RUN: bishengir-opt %s -split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+
+// CHECK: l1_prefetch_ps.reject_reason = "missing_pointer_noalias_contract"
+// CHECK-NOT: program_split.selected_input
+
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
+  func.func @_gelu_direct_56aiv(%arg0: memref<?xi8>, %arg1: memref<?xi8>, %arg2: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg3: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32}, %arg4: i32, %arg5: i32, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32) attributes {SyncBlockLockArgIdx = 0 : i64, WorkspaceArgIdx = 1 : i64, global_kernel = "local", mix_mode = "aiv", parallel_mode = "simd"} {
+    %c8192 = arith.constant 8192 : index
+    %cst = arith.constant 4.471500e-02 : f32
+    %cst_0 = arith.constant -1.59576917 : f32
+    %c4_i32 = arith.constant 4 : i32
+    %c56_i32 = arith.constant 56 : i32
+    %c2048_i32 = arith.constant 2048 : i32
+    %c16_i32 = arith.constant 16 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c148_i32 = arith.constant 148 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %cst_1 = arith.constant 1.000000e+00 : f32
+    %0 = tensor.empty() : tensor<16x2048xf32>
+    %1 = linalg.fill ins(%cst_1 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32>
+    %2 = linalg.fill ins(%cst_0 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32>
+    %3 = linalg.fill ins(%cst : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32>
+    scf.for %arg10 = %c0_i32 to %c148_i32 step %c1_i32  : i32 {
+      %4 = arith.divsi %arg10, %c4_i32 : i32
+      %5 = arith.remsi %arg10, %c4_i32 : i32
+      %6 = arith.muli %4, %c56_i32 : i32
+      %7 = arith.addi %arg7, %6 : i32
+      %8 = arith.cmpi slt, %7, %c2048_i32 : i32
+      %9 = arith.muli %7, %c16_i32 : i32
+      %10 = arith.muli %5, %c2048_i32 : i32
+      scf.if %8 {
+        %11 = arith.index_cast %9 : i32 to index
+        %12 = arith.muli %11, %c8192 : index
+        %13 = arith.index_cast %10 : i32 to index
+        %14 = arith.addi %12, %13 : index
+        %reinterpret_cast = memref.reinterpret_cast %arg2 to offset: [%14], sizes: [16, 2048], strides: [8192, 1] : memref<?xf32> to memref<16x2048xf32, strided<[8192, 1], offset: ?>>
+        %alloc = memref.alloc() : memref<16x2048xf32>
+        memref.copy %reinterpret_cast, %alloc : memref<16x2048xf32, strided<[8192, 1], offset: ?>> to memref<16x2048xf32>
+        %15 = bufferization.to_tensor %alloc restrict writable : memref<16x2048xf32>
+        %16 = arith.mulf %15, %15 : tensor<16x2048xf32>
+        %17 = arith.mulf %16, %15 : tensor<16x2048xf32>
+        %18 = arith.mulf %17, %3 : tensor<16x2048xf32>
+        %19 = arith.addf %15, %18 : tensor<16x2048xf32>
+        %20 = arith.mulf %19, %2 : tensor<16x2048xf32>
+        %21 = math.exp %20 : tensor<16x2048xf32>
+        %22 = arith.addf %21, %1 : tensor<16x2048xf32>
+        %23 = arith.divf %15, %22 : tensor<16x2048xf32>
+        %reinterpret_cast_2 = memref.reinterpret_cast %arg3 to offset: [%14], sizes: [16, 2048], strides: [8192, 1] : memref<?xf32> to memref<16x2048xf32, strided<[8192, 1], offset: ?>>
+        bufferization.materialize_in_destination %23 in writable %reinterpret_cast_2 : (tensor<16x2048xf32>, memref<16x2048xf32, strided<[8192, 1], offset: ?>>) -> ()
+      }
+    }
+    return
+  }
+}
+
+// -----
+// CHECK: l1_prefetch_ps.reject_reason = "missing_pointer_noalias_contract"
+// CHECK-NOT: program_split.selected_input
+#loc = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0)
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
+  func.func @_gelu_fwd(%arg0: memref<?xi8> loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg1: memref<?xi8> loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg2: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32} loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg3: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32} loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg4: i32 {tt.divisibility = 16 : i32} loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg5: i32 {tt.divisibility = 16 : i32} loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg6: i32 {tt.divisibility = 16 : i32} loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg7: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg8: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg9: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg10: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg11: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0), %arg12: i32 loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":22:0)) attributes {SyncBlockLockArgIdx = 0 : i64, WorkspaceArgIdx = 1 : i64, global_kernel = "local", mix_mode = "aiv", parallel_mode = "simd"} {
+    %cst = arith.constant 0.000000e+00 : f32 loc(#loc1)
+    %c0 = arith.constant 0 : index loc(#loc1)
+    %c2048 = arith.constant 2048 : index loc(#loc1)
+    %c16 = arith.constant 16 : index loc(#loc1)
+    %c15_i32 = arith.constant 15 : i32 loc(#loc20)
+    %c2048_i32 = arith.constant 2048 : i32 loc(#loc4)
+    %c0_i32 = arith.constant 0 : i32 loc(#loc4)
+    %cst_0 = arith.constant 1.000000e+00 : f32 loc(#loc5)
+    %cst_1 = arith.constant 0.797884583 : f32 loc(#loc6)
+    %cst_2 = arith.constant 4.471500e-02 : f32 loc(#loc7)
+    %c16_i32 = arith.constant 16 : i32 loc(#loc8)
+    %cst_3 = arith.constant 5.000000e-01 : f32 loc(#loc9)
+    %0 = tensor.empty() : tensor<16x2048xf32> loc(#loc5)
+    %1 = linalg.fill ins(%cst_3 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32> loc(#loc9)
+    %2 = linalg.fill ins(%cst_2 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32> loc(#loc7)
+    %3 = linalg.fill ins(%cst_1 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32> loc(#loc6)
+    %4 = linalg.fill ins(%cst_0 : f32) outs(%0 : tensor<16x2048xf32>) -> tensor<16x2048xf32> loc(#loc5)
+    %5 = arith.addi %arg5, %c15_i32 : i32 loc(#loc20)
+    %6 = arith.divsi %5, %c16_i32 : i32 loc(#loc21)
+    scf.for %arg13 = %arg10 to %6 step %arg7  : i32 {
+      %7 = arith.muli %arg13, %c16_i32 : i32 loc(#loc8)
+      scf.for %arg14 = %c0_i32 to %arg6 step %c2048_i32  : i32 {
+        %8 = arith.index_cast %7 : i32 to index loc(#loc8)
+        %9 = arith.index_cast %arg4 : i32 to index loc(#loc)
+        %10 = arith.muli %8, %9 : index loc(#loc12)
+        %11 = arith.index_cast %arg14 : i32 to index loc(#loc4)
+        %12 = arith.addi %10, %11 : index loc(#loc12)
+        %reinterpret_cast = memref.reinterpret_cast %arg2 to offset: [%12], sizes: [16, 2048], strides: [%9, 1] : memref<?xf32> to memref<16x2048xf32, strided<[?, 1], offset: ?>> loc(#loc12)
+        %alloc = memref.alloc() : memref<16x2048xf32> loc(#loc1)
+        %13 = arith.addi %8, %c16 : index loc(#loc1)
+        %14 = arith.index_cast %arg5 : i32 to index loc(#loc)
+        %15 = arith.maxsi %8, %14 : index loc(#loc1)
+        %16 = arith.minsi %13, %15 : index loc(#loc1)
+        %17 = arith.subi %16, %8 : index loc(#loc1)
+        %18 = arith.addi %11, %c2048 : index loc(#loc1)
+        %19 = arith.index_cast %arg6 : i32 to index loc(#loc)
+        %20 = arith.maxsi %11, %19 : index loc(#loc1)
+        %21 = arith.minsi %18, %20 : index loc(#loc1)
+        %22 = arith.subi %21, %11 : index loc(#loc1)
+        %23 = arith.minsi %17, %c16 : index loc(#loc1)
+        %24 = arith.maxsi %23, %c0 : index loc(#loc1)
+        %25 = arith.minsi %22, %c2048 : index loc(#loc1)
+        %26 = arith.maxsi %25, %c0 : index loc(#loc1)
+        %27 = arith.cmpi slt, %24, %c16 : index loc(#loc1)
+        %28 = arith.cmpi slt, %26, %c2048 : index loc(#loc1)
+        %29 = arith.ori %27, %28 : i1 loc(#loc1)
+        scf.if %29 {
+          linalg.fill ins(%cst : f32) outs(%alloc : memref<16x2048xf32>) loc(#loc1)
+        } {hivm.unlikely_condition} loc(#loc1)
+        %subview = memref.subview %reinterpret_cast[0, 0] [%24, %26] [1, 1] : memref<16x2048xf32, strided<[?, 1], offset: ?>> to memref<?x?xf32, strided<[?, 1], offset: ?>> loc(#loc1)
+        %subview_4 = memref.subview %alloc[0, 0] [%24, %26] [1, 1] : memref<16x2048xf32> to memref<?x?xf32, strided<[2048, 1]>> loc(#loc1)
+        memref.copy %subview, %subview_4 : memref<?x?xf32, strided<[?, 1], offset: ?>> to memref<?x?xf32, strided<[2048, 1]>> loc(#loc1)
+        %30 = bufferization.to_tensor %alloc restrict writable : memref<16x2048xf32> loc(#loc1)
+        %31 = arith.mulf %30, %30 : tensor<16x2048xf32> loc(#loc13)
+        %32 = arith.mulf %31, %30 : tensor<16x2048xf32> loc(#loc14)
+        %33 = arith.mulf %30, %1 : tensor<16x2048xf32> loc(#loc9)
+        %34 = arith.mulf %32, %2 : tensor<16x2048xf32> loc(#loc7)
+        %35 = arith.addf %30, %34 : tensor<16x2048xf32> loc(#loc15)
+        %36 = arith.mulf %35, %3 : tensor<16x2048xf32> loc(#loc6)
+        %37 = math.tanh %36 : tensor<16x2048xf32> loc(#loc16)
+        %38 = arith.addf %37, %4 : tensor<16x2048xf32> loc(#loc5)
+        %39 = arith.mulf %33, %38 : tensor<16x2048xf32> loc(#loc17)
+        %reinterpret_cast_5 = memref.reinterpret_cast %arg3 to offset: [%12], sizes: [16, 2048], strides: [%9, 1] : memref<?xf32> to memref<16x2048xf32, strided<[?, 1], offset: ?>> loc(#loc18)
+        %extracted_slice = tensor.extract_slice %39[0, 0] [%24, %26] [1, 1] : tensor<16x2048xf32> to tensor<?x?xf32> loc(#loc19)
+        %subview_6 = memref.subview %reinterpret_cast_5[0, 0] [%24, %26] [1, 1] : memref<16x2048xf32, strided<[?, 1], offset: ?>> to memref<?x?xf32, strided<[?, 1], offset: ?>> loc(#loc19)
+        bufferization.materialize_in_destination %extracted_slice in writable %subview_6 : (tensor<?x?xf32>, memref<?x?xf32, strided<[?, 1], offset: ?>>) -> () loc(#loc19)
+      } loc(#loc4)
+    } loc(#loc11)
+    return loc(#loc)
+  } loc(#loc)
+} loc(#loc)
+#loc1 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":32:28)
+#loc2 = loc("/tmp/l1-wheel.7bXNmgv5/python/triton/language/standard.py":40:22)
+#loc3 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":25:32)
+#loc4 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":28:36)
+#loc5 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":35:36)
+#loc6 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":36:38)
+#loc7 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":36:54)
+#loc8 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":27:22)
+#loc9 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":35:24)
+#loc10 = loc("/tmp/l1-wheel.7bXNmgv5/python/triton/language/standard.py":40:28)
+#loc11 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":26:38)
+#loc12 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":32:32)
+#loc13 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":34:24)
+#loc14 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":34:29)
+#loc15 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":36:43)
+#loc16 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":36:16)
+#loc17 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":35:30)
+#loc18 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":37:25)
+#loc19 = loc("/home/etis/workspace/l1-software-cache-debian/artifacts/historical-activation-source-20261007/test_l1_activation_family_hw.py":37:30)
+#loc20 = loc(callsite(#loc2 at #loc3))
+#loc21 = loc(callsite(#loc10 at #loc3))

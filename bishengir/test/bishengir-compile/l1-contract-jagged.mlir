@@ -1,0 +1,2 @@
+// RUN: bishengir-compile %S/../Dialect/HIVM/L1Prefetch/l1-prefetch-ps-jagged.mlir --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --enable-vf-fusion=false -o %t.o
+// RUN: python3 %S/Inputs/l1-contract/check.py %S/Inputs/l1-contract/jagged.json %t.o.program_split.json

@@ -468,13 +468,15 @@ tryExpandValueWithUnitDim(Value oldVal, Value refVal,
 
   Operation *expandOp;
   if (auto newMemrefTy = dyn_cast<MemRefType>(refTy)) {
+    // Use refTy (includes memory space) for the expand result — passing only
+    // newShape drops #hivm.address_space<cbuf>/ub/gm on the expanded memref.
     if (reassocIdxVecIsGenerated) {
-      expandOp = builder.create<memref::ExpandShapeOp>(loc, newShape, oldVal,
+      expandOp = builder.create<memref::ExpandShapeOp>(loc, newMemrefTy, oldVal,
                                                        reassocIdxVec);
     } else {
       auto outputShape = memref::getMixedSizes(builder, loc, refVal);
       expandOp = builder.create<memref::ExpandShapeOp>(
-          loc, newShape, oldVal, reassocIdxVec, outputShape);
+          loc, newMemrefTy, oldVal, reassocIdxVec, outputShape);
     }
   } else if (auto newTensorTy = dyn_cast<RankedTensorType>(refTy)) {
     if (reassocIdxVecIsGenerated) {
@@ -653,8 +655,10 @@ public:
           "[DropUnitDimsAllocPattern] shape does not contain unit dim");
     }
 
-    auto squeezedDstTy =
-        MemRefType::get(squeezedDstShape, dstTy.getElementType());
+    auto squeezedDstTy = MemRefType::get(squeezedDstShape,
+                                         dstTy.getElementType(),
+                                         MemRefLayoutAttrInterface{},
+                                         dstTy.getMemorySpace());
     auto newAllocOp = rewriter.create<memref::AllocOp>(loc, squeezedDstTy);
     // pass empty reassocIdxVec to create reassociations inside the func
     SmallVector<ReassociationIndices> reassocIdxVec;

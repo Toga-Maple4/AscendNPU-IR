@@ -180,6 +180,10 @@ inferCoreTypeForGlobalMixMatmulOps(GlobalMixMatmulTy *mixMatmulOp);
 
 constexpr llvm::StringLiteral kCVUnrolledLoopName =
     "cv_unrolled_loop";
+constexpr llvm::StringLiteral kSyncMemoryReadId = "hivm.sync_memory_read_id";
+constexpr llvm::StringLiteral kSyncMemoryReadIds = "hivm.sync_memory_read_ids";
+// Requests grouped transfers for this load, independent of its parent pipeline.
+constexpr llvm::StringLiteral kGroupedL1LoadAttrName = "hivm.grouped_l1_load";
 constexpr llvm::StringLiteral kMultibufferUnrollAttrName =
     "multibuffer_unroll_factor";
 constexpr llvm::StringLiteral kPipelinedLoopCoreTypeAttrName =

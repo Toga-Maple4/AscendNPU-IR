@@ -160,11 +160,22 @@ load_gm_to_cbuf_2d_core_with_contiguous_last_dim(memref_t<__gm__ T, 2> *gm,
   int64_t stride0_gm = gm->strides[0];
   int64_t stride0_cbuf = cbuf->strides[0];
   constexpr int32_t bytes = sizeof(T);
+#if !defined(__DAV_C310__)
   const int64_t cbuf_gap = (stride0_cbuf - size1) * bytes / L1_ALIGN_BYTES;
   const int64_t gm_gap = (stride0_gm - size1) * bytes / L1_ALIGN_BYTES;
+#else
+  const int64_t cbuf_gap = (stride0_cbuf - size1) * bytes;
+  const int64_t gm_gap = (stride0_gm - size1) * bytes;
+#endif
 
-  if (gm_gap > INTRIN_MAX_GAP || 0 > cbuf_gap || 0 > stride0_gm - size1)
-      [[unlikely]] {
+  bool requires_row_copy = false;
+#if defined(__DAV_C310__)
+  // C310 align-v2 multi-burst encoding does not preserve a strided rank-2
+  // memref's complete row geometry through this generic template ABI.
+  requires_row_copy = stride0_gm != size1 || stride0_cbuf != size1;
+#endif
+  if (requires_row_copy || gm_gap > INTRIN_MAX_GAP || 0 > cbuf_gap ||
+      0 > stride0_gm - size1) [[unlikely]] {
     // special cases of stride, unlikely used
     const int64_t size0 = gm->sizes[0];
     for (int64_t i = 0; i < size0; i++) {
@@ -186,8 +197,13 @@ load_gm_to_cbuf_2d_core_with_contiguous_last_dim(memref_t<__gm__ T, 2> *gm,
     int64_t size0 = gm->sizes[0];
     auto gm_ptr = gm->aligned + gm->offset;
     auto cbuf_ptr = cbuf->aligned + cbuf->offset;
-    // burst_len of gm <-> l1 is in units of 32bytes.
+#if !defined(__DAV_C310__)
+    // Legacy GM <-> L1 burst lengths are in units of 32 bytes.
     const int64_t burst_len = CEIL_DIV(size1 * bytes, L1_ALIGN_BYTES);
+#else
+    // A5 align-v2 burst lengths and strides are byte-valued.
+    const int64_t burst_len = size1 * bytes;
+#endif
     const int32_t burst_cnt_main = size0 / INTRIN_MAX_BURST_CNT;
     const int32_t burst_cnt_tail = size0 % INTRIN_MAX_BURST_CNT;
     if (burst_cnt_main > 0) [[unlikely]] {

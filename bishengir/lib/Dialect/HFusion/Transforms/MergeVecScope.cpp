@@ -13,6 +13,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Utils/MemrefAliasAnalysisState.h"
 #include "bishengir/Dialect/HIVM/Utils/RegbaseUtils.h"
+#include "bishengir/Dialect/HIVM/Utils/UBPlanReleaseUtils.h"
 #include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -1195,7 +1196,8 @@ void MergeVecScopePass::GetMemOps(const SmallVector<Operation *> &betweenOps,
             hfusion::IndirectStoreOp, memref::LoadOp, memref::StoreOp,
             memref::CopyOp, memref::SubViewOp, memref::AllocOp,
             memref::ExpandShapeOp, memref::CollapseShapeOp, tensor::EmptyOp,
-            tensor::ExtractSliceOp, tensor::DimOp, annotation::MarkOp>(op)) {
+            tensor::ExtractSliceOp, tensor::DimOp, annotation::MarkOp,
+            memref::DeallocOp>(op)) {
       if (memOpsSet.insert(op).second) {
         memOps.push_back(op);
       }
@@ -1549,8 +1551,16 @@ void MergeVecScopePass::mergeNoMemory(
                       mergedBlock->getArgument(externalStartIdx + i));
   for (auto &it : call1ResultMap)
     betweenMapper.map(it.first, it.second);
+  SetVector<Value> ubPlanReleaseRoots;
   for (auto &opInfo : betweenInfo) {
     Operation *op = opInfo.first;
+    if (hivm::isUBPlanReleaseOp(op)) {
+      if (auto memref = hivm::getUBPlanReleaseMemref(op)) {
+        if (auto root = hivm::traceUBAllocRoot(*memref))
+          ubPlanReleaseRoots.insert(*root);
+      }
+      continue;
+    }
     Operation *cloned = builder.clone(*op, betweenMapper);
     for (unsigned i = 0; i < op->getNumResults(); i++)
       betweenMapper.map(op->getResult(i), cloned->getResult(i));
@@ -1589,6 +1599,8 @@ void MergeVecScopePass::mergeNoMemory(
   builder.create<func::ReturnOp>(root.getLoc(), mergedReturns);
 
   OpBuilder rootBuilder(call1);
+  for (Value root : ubPlanReleaseRoots)
+    hivm::createUBPlanReleaseMark(rootBuilder, call1.getLoc(), root);
 
   SmallVector<Value> newCallOperands;
   // vf1 operands

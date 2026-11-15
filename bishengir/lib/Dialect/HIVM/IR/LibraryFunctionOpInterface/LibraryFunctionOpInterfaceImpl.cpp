@@ -197,6 +197,15 @@ std::string getCopyLikeOpLibraryCallName(OpTy op,
   auto baseCallName = getLibraryCallNameForCopyLikeOp(
       op.getOpName().str(), op.getSrc().getType(), op.getDst().getType(),
       op.getLoc(), getOpLibraryCallRankImpl(op.getOperation(), rank));
+  // Preserve the producer's explicit grouped New-L1 transfer capability.
+  if constexpr (std::is_same_v<OpTy, LoadOp>) {
+    if (op->template hasAttrOfType<UnitAttr>(kGroupedL1LoadAttrName) && rank == 2 &&
+        getHIVMAddressSpace(op.getSrc().getType()) == AddressSpace::GM &&
+        getHIVMAddressSpace(op.getDst().getType()) == AddressSpace::L1 &&
+        (srcMemref.getElementType().isF16() ||
+         srcMemref.getElementType().isBF16() || srcMemref.getElementType().isF32()))
+      baseCallName += "_program_split";
+  }
   return baseCallName;
 }
 
@@ -343,8 +352,11 @@ std::string getL12UBOpLibraryCallName(L12UBOp concreteOp,
   std::string dataTypeStr =
       getTypeName(concreteOp.getLoc(), getElementTypeOrSelf(srcType));
   // make library function name
-  return concreteOp.getOpName().str() + "_" + srcRankStr + "_to_" + dstRankStr +
-         "_" + dataTypeStr;
+  std::string callName = concreteOp.getOpName().str() + "_" + srcRankStr +
+                         "_to_" + dstRankStr + "_" + dataTypeStr;
+  if (concreteOp.getSubBlockid())
+    callName += "_sub1";
+  return callName;
 }
 
 std::string callNameMangleSuffix(Operation *op) {
@@ -930,7 +942,17 @@ int InferMaxRankExternalModel<LoadOp>::inferOpLibraryMaxRank(
   // RegBase only provides the 1D GM->L1 (cbuf) load template. Higher-rank
   // copies must be lowered to outer loops around that template call; all
   // other directions keep the static 3D rank on every target.
-  return isGMToCbufCopyOnRegBase(cast<LoadOp>(operation)) ? 1 : 3;
+  auto load = cast<LoadOp>(operation);
+  // New-L1 supplies its own grouped 2D ABI. Keep that rank through both
+  // loop lowering and symbol selection; ordinary RegBase loads stay 1D.
+  auto src = cast<MemRefType>(load.getSrcOperandType());
+  if (isGMToCbufCopyOnRegBase(load) &&
+      operation->hasAttrOfType<UnitAttr>(kGroupedL1LoadAttrName) &&
+      src.getRank() == 2 &&
+      (src.getElementType().isF16() || src.getElementType().isBF16() ||
+       src.getElementType().isF32()))
+    return 2;
+  return isGMToCbufCopyOnRegBase(load) ? 1 : 3;
 }
 
 template <>

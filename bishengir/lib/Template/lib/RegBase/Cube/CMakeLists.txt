@@ -1,11 +1,13 @@
 set(A5_REGBASE_CUBE_SOURCES
     Copy1D.cpp
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../DMA/Cbuf/Copy2D.cpp"
     Fixpipe.cpp
     GlobalMmad.cpp
     LocalConv.cpp
     LocalMmad.cpp
     LocalMmadMx.cpp
     l12ub.cpp
+    l12ub_nd2nd.cpp
     loadMXScale.cpp
     nchw2c1hwnc0.cpp
     nchw2nc1hwc0.cpp

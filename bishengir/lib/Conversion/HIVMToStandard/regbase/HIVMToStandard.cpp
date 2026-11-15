@@ -178,6 +178,14 @@ static func::CallOp createLibCall(PatternRewriter &rewriter, Operation *op,
     // marked always_inline with hivm.inline_mode.
     bool markNoInline = hivm::detail::getMarkLibCallNoInline() &&
                         funcCoreType == hivm::TFuncCoreType::AIV;
+    // Keep the 2D UB-to-GM store helper inline: its out-of-line form produces
+    // incorrect dynamic-stride stores with CANN 9.1.0-beta.3. This exception
+    // covers the helper family, not particular kernels or shapes, and leaves
+    // the default policy for other library calls unchanged.
+    if (isa<hivm::StoreOp>(op) &&
+        llvm::StringRef(libCallName).starts_with("store_ubuf_to_gm_2d_"))
+      markNoInline = false;
+
     std::optional<hivm::InlineMode> inlineMode;
     if (auto customOp = dyn_cast<hivm::CustomOp>(op))
       inlineMode =

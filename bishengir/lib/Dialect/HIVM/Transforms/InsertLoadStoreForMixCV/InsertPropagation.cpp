@@ -17,10 +17,12 @@
 
 #include "bishengir/Dialect/HIVM/Transforms/InsertLoadStoreForMixCV/InsertPropagation.h"
 
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/CustomOp/CustomOpUtils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/Transforms/InsertLoadStoreForMixCV/Utils.h"
 #include "bishengir/Dialect/HIVM/Utils/RegbaseUtils.h"
+#include "bishengir/Dialect/MemRef/IR/MemRefImpl.h"
 #include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -35,6 +37,52 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir::hivm {
+
+/// In: the memref a hivm.hir.load writes into (a subview of a plain staging
+/// alloc whose real storage is named by a `bind_buffer` mark).
+/// Out: true when that storage lives in L1 (cbuf), i.e. the load is a GM->L1
+/// stage and therefore belongs to the cube, not the vector core.
+///
+/// The mark is attached to the *tensor* view of the alloc, not to the memref:
+///
+///   %staging = memref.alloc() : memref<32x2048xf16>          // no addr space
+///   %dst     = memref.subview %staging ...                   // the load dst
+///   %t       = bufferization.to_tensor %staging ...
+///   annotation.mark %t [bind_buffer = %l1 : ...<cbuf>]       // real storage
+///
+/// so reaching it means hopping alloc -> to_tensor -> mark. BindBuffer, which
+/// would put the address space on the memref itself, does not run until after
+/// SplitMixKernel -- by which point the core-type decision has already been made.
+static bool isStagedIntoL1(Value dst) {
+  auto maybeAlloc = utils::tracebackMemRefToAlloc(dst);
+  if (!maybeAlloc.has_value())
+    return false;
+
+  auto marksL1 = [](Operation *user) {
+    auto markOp = dyn_cast<annotation::MarkOp>(user);
+    if (!markOp ||
+        !markOp.isAnnotatedByDynamicAttr(memref::kBindBufferAttrName))
+      return false;
+    Value target = markOp.getDynamicAttrValue(memref::kBindBufferAttrName);
+    if (!target)
+      return false;
+    auto targetType = dyn_cast<MemRefType>(target.getType());
+    return targetType &&
+           getHIVMAddressSpace(targetType) == hivm::AddressSpace::L1;
+  };
+
+  for (Operation *user : maybeAlloc.value().getResult().getUsers()) {
+    if (marksL1(user))
+      return true;
+    auto toTensor = dyn_cast<bufferization::ToTensorOp>(user);
+    if (!toTensor)
+      continue;
+    for (Operation *tensorUser : toTensor.getResult().getUsers())
+      if (marksL1(tensorUser))
+        return true;
+  }
+  return false;
+}
 
 LogicalResult
 InsertPropagationPattern::matchAndRewrite(Operation *op,
@@ -135,8 +183,21 @@ LogicalResult InsertPropagationPattern::insertPropagatorForDMAOp(
           return failure();
         PropagatorUtil::createPropagatorUp(srcOp, hivm::AddressSpace::GM,
                                            rewriter);
-        if (auto forOp = dyn_cast<scf::ForOp>(op->getParentOp());
-            forOp && forOp->hasAttr(hivm::ParallelLoopAttr::name)) {
+        if (isStagedIntoL1(op.getDst())) {
+          // A GM->L1 staging load: its destination is bound to a cbuf buffer,
+          // so it runs on the cube. This must be checked before the
+          // parallel-loop case below, whose "unstructured load is always UB
+          // load" assumption would label it VECTOR -- SplitMixKernel would then
+          // drop it from the AIC clone (wrong core) *and* from the AIV clone
+          // (its buffer is cube-side), leaving the L1 slots unwritten and the
+          // kernel reading uninitialised L1.
+          PropagatorUtil::createPropagatorUp(dstOp, TCoreType::CUBE,
+                                             hivm::AddressSpace::L1, rewriter);
+          PropagatorUtil::createPropagatorsDown(op, TCoreType::CUBE,
+                                                hivm::AddressSpace::L1,
+                                                rewriter);
+        } else if (auto forOp = dyn_cast<scf::ForOp>(op->getParentOp());
+                   forOp && forOp->hasAttr(hivm::ParallelLoopAttr::name)) {
           // Unstructured load is always UB load
           PropagatorUtil::createPropagatorUp(dstOp, TCoreType::VECTOR,
                                              hivm::AddressSpace::UB, rewriter);
@@ -280,6 +341,16 @@ A5InsertionPattern::matchAndRewrite(Operation *op,
           return failure();
         PropagatorUtil::createPropagatorUp(srcOp, hivm::AddressSpace::GM,
                                            rewriter);
+        if (isStagedIntoL1(op.getDst())) {
+          // This explicit binding is a direct GM->L1 transfer, not an
+          // ordinary cube candidate waiting for ND2NZ conversion.
+          op.setTcoretypeAttr(TCoreTypeAttr::get(op.getContext(), TCoreType::CUBE));
+          PropagatorUtil::createPropagatorUp(dstOp, TCoreType::CUBE,
+                                           hivm::AddressSpace::L1, rewriter);
+          PropagatorUtil::createPropagatorsDown(op, TCoreType::CUBE,
+                                             hivm::AddressSpace::L1, rewriter);
+          return success();
+        }
         PropagatorUtil::createPropagatorUp(dstOp, TCoreType::CUBE_AND_VECTOR,
                                            rewriter);
         PropagatorUtil::createPropagatorsDown(op, TCoreType::CUBE_AND_VECTOR,

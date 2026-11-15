@@ -816,6 +816,13 @@ DataLayoutInferAndPropagateHelper::propagateDataLayoutToUsers(
               changed.push_back(result);
           }
         })
+        .Case<memref::MemorySpaceCastOp>([&](memref::MemorySpaceCastOp op) {
+          // memory_space_cast only changes the address space; the data
+          // layout (e.g. nZ) carries through unchanged. bind-buffer inserts
+          // these casts between an L1 alloc and its consumer, so the layout
+          // must propagate across them to reach the feeding copy/load.
+          updateLayout(op->getResults(), info, changed);
+        })
         .Case<bishengir::memref_ext::AllocWorkspaceOp>(
             [&](bishengir::memref_ext::AllocWorkspaceOp op) {
               // Do not overwrite layouts already set by MarkOp / anchors.
@@ -1101,6 +1108,28 @@ DataLayoutInferAndPropagateHelper::rewriteMemrefCastOp(memref::CastOp op) {
   return newMemrefCastOp.getOperation();
 }
 
+Operation *DataLayoutInferAndPropagateHelper::rewriteMemorySpaceCastOp(
+    memref::MemorySpaceCastOp op) {
+  // bind-buffer inserts memory_space_cast between an L1 alloc and its
+  // consumer. When the alloc is reshaped to its fractal (nZ) layout, the
+  // cast must follow: rebuild it on the rewritten (reshaped) source while
+  // preserving the destination address space.
+  OpBuilder builder(op);
+  Location loc = op.getLoc();
+  Value src = op.getSource();
+  auto layoutInfo = layout_info_.lookup(src);
+  auto rewrittenValue = getValueAs(src, layoutInfo.targetLayout);
+  auto rewrittenSrcType = cast<MemRefType>(rewrittenValue.getType());
+  auto dstType = cast<MemRefType>(op.getDest().getType());
+  Type newResType = MemRefType::get(
+      rewrittenSrcType.getShape(), rewrittenSrcType.getElementType(),
+      rewrittenSrcType.getLayout(), dstType.getMemorySpace());
+  auto newCastOp =
+      builder.create<memref::MemorySpaceCastOp>(loc, newResType, rewrittenValue);
+  map(op.getResult(), newCastOp.getResult(), layoutInfo.targetLayout);
+  return newCastOp.getOperation();
+}
+
 Operation *DataLayoutInferAndPropagateHelper::rewriteOp(Operation *op) {
   opsToDelete_.insert(op);
   return TypeSwitch<Operation *, Operation *>(op)
@@ -1112,6 +1141,8 @@ Operation *DataLayoutInferAndPropagateHelper::rewriteOp(Operation *op) {
       .Case<scf::ForOp>([&](auto op) { return rewriteForOp(op); })
       .Case<scf::IfOp>([&](auto op) { return rewriteIfOp(op); })
       .Case<memref::CastOp>([&](auto op) { return rewriteMemrefCastOp(op); })
+      .Case<memref::MemorySpaceCastOp>(
+          [&](auto op) { return rewriteMemorySpaceCastOp(op); })
       .Default([](auto) {
         llvm::report_fatal_error("unexpected op in rewrite");
         return nullptr;

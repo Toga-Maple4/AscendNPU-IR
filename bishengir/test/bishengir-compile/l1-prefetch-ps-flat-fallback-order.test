@@ -1,0 +1,2 @@
+// Exercise the active A5 driver with the unchanged two-input RecSys fixture.
+// RUN: %python %S/Inputs/check_l1_retry_fallback.py bishengir-compile %S/../Dialect/HIVM/L1Prefetch/l1-prefetch-ps-flat.mlir %t

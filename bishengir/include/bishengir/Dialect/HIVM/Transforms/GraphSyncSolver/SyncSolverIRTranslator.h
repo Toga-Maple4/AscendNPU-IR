@@ -33,6 +33,9 @@
 
 namespace mlir::hivm::syncsolver {
 
+/// Validate explicit final-reader metadata before constructing solver IR.
+LogicalResult validateSyncMemoryReadIds(func::FuncOp func);
+
 using AnchorMap = llvm::DenseMap<int64_t, hivm::AnchorOp>;
 
 struct CVTripletKernels {
@@ -72,6 +75,9 @@ public:
   // Aliases for block arguments collected from cf::CondBranchOp and
   // cf::BranchOp operations.
   llvm::DenseMap<Value, llvm::SmallVector<Value>> blockArgAliases;
+
+  // Validated buffer identities, collected once per source function.
+  llvm::DenseMap<Operation *, llvm::DenseMap<int32_t, Value>> syncReadBuffers;
 
   // Ordered map anchor-id -> (anchor op / anchor-attr marked op).
   std::map<int64_t, OperationBase *> anchorOpMap;

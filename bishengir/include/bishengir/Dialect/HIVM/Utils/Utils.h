@@ -578,6 +578,11 @@ constexpr static unsigned VL_BITS = VL * BITS_PER_BYTE;
 constexpr static unsigned PREDICATE_BITS = 256;
 constexpr static unsigned INTRA_BLOCK_FLAG_ID_OFFSET = 16;
 
+// The A5 event namespace assigns one bank to each vector subcore.
+constexpr uint64_t intraBlockFlagForSubcore(uint64_t flag, unsigned subcore) {
+  return flag + subcore * INTRA_BLOCK_FLAG_ID_OFFSET;
+}
+
 constexpr static unsigned VL_B32 = VL / 4;
 constexpr static unsigned VL_B16 = VL / 2;
 constexpr static unsigned VL_B8 = VL;

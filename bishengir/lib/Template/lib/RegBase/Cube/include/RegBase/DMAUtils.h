@@ -603,7 +603,10 @@ load_gm_to_ubuf_2d_core_with_contiguous_last_dim(memref_t<__gm__ T, 2> *gm,
   const int64_t ub_gap = (stride0_ub - size1) * bytes;
   const int64_t gm_gap = (stride0_gm - size1) * bytes;
   bool is_over_gap = stride0_gm * bytes > INTRIN_MAX_STRIDE;
-  if (is_over_gap || 0 > ub_gap || 0 > gm_gap) [[unlikely]] {
+  const bool requires_row_copy =
+      stride0_ub != size1 || stride0_gm != size1;
+  if (requires_row_copy || is_over_gap || 0 > ub_gap || 0 > gm_gap)
+      [[unlikely]] {
     // special cases of stride, unlikely used
     if (stride0_ub * bytes % INTR_BYTES_PER_BLOCK != 0) {
       load_gm_to_ubuf_2d_by_scalar<T>(gm, ub);

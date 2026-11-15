@@ -28,6 +28,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "mlir/IR/Visitors.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #define DEBUG_TYPE "memref-dse"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -155,6 +156,60 @@ private:
     loadOp.erase();
   }
 
+  // Returns true when loadOp writes into a buffer that is *read* by some op
+  // inside a loop that also encloses loadOp. Such a read executes after the
+  // write via that loop's back-edge (a later iteration), so the write is live
+  // and must be kept -- the linear liveness walk in eraseUnusedLoad cannot see
+  // the back-edge on its own.
+  //
+  // We search the *outermost* enclosing loop, not just the nearest one: with
+  // nested loops the write may sit in an inner loop while the read that consumes
+  // it is carried by an outer loop, e.g.
+  //
+  //   scf.for {              // outer -- carries %buf across iterations
+  //     hivm.hir.l12ub %buf  // read (top)
+  //     scf.for { ... }      // inner compute
+  //     scf.for {            // inner
+  //       hivm.hir.load %buf // prefetch write (bottom)
+  //     }
+  //   }
+  //
+  // Walking only the inner loop would miss the outer read and wrongly erase the
+  // prefetch. The outermost loop contains the whole nest, so any loop-carried
+  // read at any depth is found.
+  bool isTargetReadWithinEnclosingLoop(hivm::LoadOp loadOp) {
+    LoopLikeOpInterface outermostLoop = nullptr;
+    for (Operation *parent = loadOp->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto loop = dyn_cast<LoopLikeOpInterface>(parent))
+        outermostLoop = loop;
+    if (!outermostLoop)
+      return false;
+
+    Value target = analyzer.getAllocOf(loadOp.getTarget());
+    if (!target)
+      return false;
+
+    bool loopCarriedRead = false;
+    outermostLoop->walk([&](MemoryEffectOpInterface memOp) {
+      if (memOp.getOperation() == loadOp.getOperation())
+        return WalkResult::advance();
+      SmallVector<MemoryEffects::EffectInstance> effects;
+      memOp.getEffects(effects);
+      for (const MemoryEffects::EffectInstance &effect : effects) {
+        if (!isa<MemoryEffects::Read>(effect.getEffect()))
+          continue;
+        Value value = effect.getValue();
+        if (value && analyzer.getAllocOf(value) == target) {
+          loopCarriedRead = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    return loopCarriedRead;
+  }
+
   // erase load if the users of the result and outs are not used
   // no read uses of the alloc should be after the load
   void eraseUnusedLoad() {
@@ -175,6 +230,15 @@ private:
         if (static_cast<const int>(allocIdx) !=
             analyzer.valueToIndexMap.at(
                 analyzer.getAllocOf(loadOp.getTarget())))
+          break;
+
+        // A store whose buffer is read by a *later* iteration through the loop
+        // back-edge is not dead. This walk over OpsOfAlloc is in linear program
+        // order and does not model the back-edge, so a prefetch write at the
+        // bottom of a loop that is consumed by the next iteration's read at the
+        // top (a software-pipelined GM->L1 prefetch into a ping/pong cbuf) would
+        // otherwise be wrongly erased, leaving L1 read uninitialised.
+        if (isTargetReadWithinEnclosingLoop(loadOp))
           break;
 
         LDBG("erasing unusedOp " << *loadOp);

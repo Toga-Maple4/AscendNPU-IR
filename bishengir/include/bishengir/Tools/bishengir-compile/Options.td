@@ -677,6 +677,12 @@ def EnableAutoBlockifyLoop : HIVMOptimizationControlOptions<
   "false"
 >;
 
+def EnableProgramSplitMix : HIVMOptimizationControlOptions<
+  "Use the accepted whole-program MIX split plan instead of auto blockification.",
+  "bool",
+  "false"
+>;
+
 def SuperBlockFactor : HIVMOptimizationControlOptions<
   "The factor of super-blocking (must be a power of 2, >= 1). "
   "1 means no super-blocking.",

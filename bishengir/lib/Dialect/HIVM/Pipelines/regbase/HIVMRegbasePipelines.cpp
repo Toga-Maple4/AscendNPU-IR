@@ -35,6 +35,8 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
+#include <cstdlib>
+
 namespace mlir {
 namespace hivm {
 namespace regbase {
@@ -72,7 +74,8 @@ void canonicalizationHIVMPipeline(OpPassManager &pm) {
   ADD_CANONICALIZER_PASS_WITHOUT_OPTION_DEFS;
   pm.nest<func::FuncOp>().addPass(createHIVMOptSinglePointPass());
   ADD_CANONICALIZER_PASS_WITHOUT_OPTION_DEFS;
-  pm.nest<func::FuncOp>().addPass(memref::createDeadStoreEliminationPass());
+  if (!std::getenv("BISHENGIR_DISABLE_MEMREF_DSE"))
+    pm.nest<func::FuncOp>().addPass(memref::createDeadStoreEliminationPass());
   ADD_CANONICALIZER_PASS_WITHOUT_OPTION_DEFS;
 }
 
@@ -225,7 +228,11 @@ hivmCrossCoreAutoSyncPipeline(OpPassManager &pm,
   if (hivmPipelineOptions.disableAutoInjectBlockSync) {
     return;
   }
-  if (!hivmPipelineOptions.enableHIVMCrossCoreGSS) {
+  // Preserve the source New-L1 post-store completion dependency: delayed
+  // anchors are established before outlining and do not carry that dependency.
+  if (hivmPipelineOptions.enableProgramSplitMix) {
+    hivmCrossCoreAutoSyncGSSPipeline(pm, hivmPipelineOptions, mode);
+  } else if (!hivmPipelineOptions.enableHIVMCrossCoreGSS) {
     hivmCrossCoreAutoSyncINJPipeline(pm, hivmPipelineOptions, mode);
   } else if (hivmPipelineOptions.enableHIVMDelayedCrossCoreGSS) {
     hivmDelayedCrossCoreAutoSyncGSSPipeline(pm, hivmPipelineOptions, mode);
@@ -243,6 +250,7 @@ bufferizationPipeline(OpPassManager &pm,
     pm.nest<func::FuncOp>().addPass(createCloneTensorEmptyPass());
     pm.nest<func::FuncOp>().addPass(createSinkOpToConsumerInLoopPass());
   }
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   if (hivmPipelineOptions.enableVfMergeLevel == 1) {
     MergeVecScopeOptions VfMergeOpsOpt;
     VfMergeOpsOpt.mergeLevel = 1;
@@ -269,6 +277,7 @@ bufferizationPipeline(OpPassManager &pm,
   // resolveConflicts) can expose conflicts that were previously masked.
   pm.addPass(hivm::createTensorCopyInsertionPass(oneShotOptions));
   pm.addPass(bufferization::createOneShotBufferizePass(oneShotOptions));
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   if (hivmPipelineOptions.enableVfMergeLevel == 2) {
     MergeVecScopeOptions VfMergeOpsOpt;
     VfMergeOpsOpt.mergeLevel = 2;
@@ -313,6 +322,7 @@ hivmWorkspacePipeline(OpPassManager &pm,
   BindWorkSpaceArgOptions options;
   options.enableSubWorkspace = true;
   pm.nest<func::FuncOp>().addPass(createBindWorkSpaceArgPass(options));
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   PlanMemoryRegBaseOptions planMemoryOption;
   planMemoryOption.memMode = MemPlanMode::GLOBAL_WORKSPACE_PLAN;
   planMemoryOption.enableGlobalReuse =
@@ -399,7 +409,11 @@ static void hivmPreBufferizationOptimizationPipeline(
   // AutoBlockifyParallelLoopPass needs to be after infer core type because
   // num. of physical blocks we loop on is dependent on core type
   if (hivmPipelineOptions.enableTritonKernelCompile &&
-      hivmPipelineOptions.enableAutoBlockifyLoop) {
+      hivmPipelineOptions.enableProgramSplitMix) {
+    pm.addPass(createProgramSplitMixBlockifyPass());
+    pm.addPass(createProgramSplitL1MaterializePass());
+  } else if (hivmPipelineOptions.enableTritonKernelCompile &&
+             hivmPipelineOptions.enableAutoBlockifyLoop) {
     pm.addPass(createAutoBlockifyParallelLoopPass());
   }
 
@@ -451,6 +465,7 @@ static void hivmPreBufferizationOptimizationPipeline(
   pm.addPass(createPartitionAndBindSubBlockPass());
   pm.nest<func::FuncOp>().addPass(createInferVFModePass());
 
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   PlanMemoryRegBaseOptions planMemoryOption;
   planMemoryOption.memMode = MemPlanMode::GLOBAL_WORKSPACE_PLAN;
   planMemoryOption.enableGlobalReuse =
@@ -495,7 +510,11 @@ static void hivmPreBufferizationOptimizationPipeline(
 
   // Split mix kernel is done before bufferization because it depends on
   // tensor SSA property.
+  if (hivmPipelineOptions.enableTritonKernelCompile)
+    pm.nest<func::FuncOp>().addPass(createSplitMixedIfConditionalsPass());
   pm.addPass(createSplitMixKernelPass());
+  if (hivmPipelineOptions.enableProgramSplitMix)
+    pm.nest<func::FuncOp>().addPass(createProgramSplitL1FinalizeSyncPass());
   if (enableRegisteredPreloadHeuristics(hivmPipelineOptions)) {
     MergeSamePreloadScopesOptions mergeOpts;
     mergeOpts.enablePreload = true;
@@ -667,6 +686,7 @@ static void hivmPostBufferizationOptimizationPipeline(
   multiBufferOptions.gmMultiBufferNum = 1;
   pm.nest<func::FuncOp>().addPass(
       createMarkMultiBufferPass(multiBufferOptions));
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   PlanMemoryRegBaseOptions planMemoryOption;
   planMemoryOption.enablePrintMemoryAllocatedSize =
       hivmPipelineOptions.enablePrintMemoryAllocatedSize;
@@ -701,6 +721,8 @@ static void hivmPostBufferizationOptimizationPipeline(
   }
   // Intra-Core Auto-Sync passes (Inject-Sync, GSS)
   hivmIntraCoreSyncPipeline(pm, hivmPipelineOptions);
+  if (hivmPipelineOptions.enableProgramSplitMix)
+    pm.nest<func::FuncOp>().addPass(createProgramSplitL1ConsumerSyncPass());
   pm.addPass(mlir::createMemrefExtLoweringPass());
   pm.nest<func::FuncOp>().addPass(createEnableMultiBufferPass());
   pm.nest<func::FuncOp>().addPass(createLowerMultiBufferCounterPass());

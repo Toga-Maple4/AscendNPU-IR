@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "kind": "split_mix_half_grid",
+  "guard": {
+    "kind": "metadata_bounded_tiles",
+    "roles": {
+      "input_stride": {
+        "arg": 4,
+        "type": "i32"
+      },
+      "inputs": [
+        {
+          "arg": 2,
+          "type": "*bf16"
+        }
+      ],
+      "matrix_stride": {
+        "arg": 7,
+        "type": "i32"
+      },
+      "offsets": {
+        "arg": 3,
+        "type": "*i64"
+      },
+      "output": {
+        "arg": 5,
+        "type": "*bf16"
+      },
+      "stride": {
+        "arg": 6,
+        "type": "i32"
+      }
+    },
+    "tile": {
+      "cols": 256,
+      "element_bits": 16,
+      "rows": 256
+    },
+    "tile_mode": "partial"
+  },
+  "launch": {
+    "allow_odd_grid": false,
+    "distribution": "resident_pairs",
+    "resident_stride": 28
+  },
+  "target": "Ascend950PR_9579",
+  "compile_options": {
+    "enable_vf_fusion": false,
+    "disable_vf_reachable_check": false,
+    "hfusion_max_buffer_count_tuning": 0,
+    "enable_auto_multi_buffer": false
+  }
+}

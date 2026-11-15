@@ -170,6 +170,7 @@ private:
   Operation *rewriteSubViewOp(memref::SubViewOp op);
   Operation *rewriteCollapseShapeOp(memref::CollapseShapeOp op);
   Operation *rewriteMemrefCastOp(memref::CastOp op);
+  Operation *rewriteMemorySpaceCastOp(memref::MemorySpaceCastOp op);
   void rewriteCopyOp(mlir::Operation *op);
   /// Try to fold ConvertLayoutOp + CopyOp to HIVM Data Copy Ops with
   /// on-the-fly data layout conversion.

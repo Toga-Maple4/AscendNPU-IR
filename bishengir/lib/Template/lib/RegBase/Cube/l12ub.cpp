@@ -39,7 +39,8 @@ check_inputs_of_copy_cbuf_to_ub_5d_to_3d_core(memref_t<__cbuf__ T, 5> *src,
 template <typename T>
 __aicore__ __attribute__((always_inline)) void
 copy_cbuf_to_ub_4d_to_2d_core(memref_t<__cbuf__ T, 4> *src,
-                              memref_t<__ubuf__ T, 2> *dst) {
+                              memref_t<__ubuf__ T, 2> *dst,
+                              bool sub_blockid = false) {
   check_inputs_of_copy_cbuf_to_ub_4d_to_2d_core(src, dst);
 
   __cbuf__ T *src_ptr = src->aligned + src->offset;
@@ -70,8 +71,12 @@ copy_cbuf_to_ub_4d_to_2d_core(memref_t<__cbuf__ T, 4> *src,
           int64_t unit = 32; // assuming size3 * sizeof(T) is at least 32 and is
                              // divisible by 32
           // TODO: use nBurst to simplify the loop
+          // The 3rd arg of copy_cbuf_to_ubuf is `sub_blockid` (NOT sid): it
+          // selects which sub-vector core's private UB the AIC writes into
+          // (false -> veccore0, true -> veccore1). Threading it lets a MIX
+          // kernel feed both veccores from L1, mirroring fixpipe dual_dst.
           INTRINSIC(copy_cbuf_to_ubuf, cur_dst, cur_src,
-                    0,                        // sid
+                    sub_blockid,              // sub_blockid (veccore select)
                     1,                        // nBurst
                     size3 * sizeof(T) / unit, // lenBurst
                     0,                        // srcGap
@@ -88,7 +93,8 @@ copy_cbuf_to_ub_4d_to_2d_core(memref_t<__cbuf__ T, 4> *src,
 template <typename T>
 __aicore__ __attribute__((always_inline)) void
 copy_cbuf_to_ub_5d_to_3d_core(memref_t<__cbuf__ T, 5> *src,
-                              memref_t<__ubuf__ T, 3> *dst) {
+                              memref_t<__ubuf__ T, 3> *dst,
+                              bool sub_blockid = false) {
   check_inputs_of_copy_cbuf_to_ub_5d_to_3d_core(src, dst);
 
   __cbuf__ T *src_ptr = src->aligned + src->offset;
@@ -114,7 +120,7 @@ copy_cbuf_to_ub_5d_to_3d_core(memref_t<__cbuf__ T, 5> *src,
                                       dst->offset + i * dst->strides[0],
                                       {dst->sizes[1], dst->sizes[2]},
                                       {dst->strides[1], dst->strides[2]}};
-    copy_cbuf_to_ub_4d_to_2d_core(&src_4d, &dst_2d);
+    copy_cbuf_to_ub_4d_to_2d_core(&src_4d, &dst_2d, sub_blockid);
   }
 }
 
@@ -142,4 +148,28 @@ REGISTER_L12UB(int32_t, 5, 3)
 REGISTER_L12UB(uint32_t, 5, 3)
 REGISTER_L12UB(int64_t, 5, 3)
 REGISTER_L12UB(uint64_t, 5, 3)
+
+REGISTER_L12UB_SUB1(float, 4, 2)
+REGISTER_L12UB_SUB1(bfloat16_t, 4, 2)
+REGISTER_L12UB_SUB1(half, 4, 2)
+REGISTER_L12UB_SUB1(int8_t, 4, 2)
+REGISTER_L12UB_SUB1(uint8_t, 4, 2)
+REGISTER_L12UB_SUB1(int16_t, 4, 2)
+REGISTER_L12UB_SUB1(uint16_t, 4, 2)
+REGISTER_L12UB_SUB1(int32_t, 4, 2)
+REGISTER_L12UB_SUB1(uint32_t, 4, 2)
+REGISTER_L12UB_SUB1(int64_t, 4, 2)
+REGISTER_L12UB_SUB1(uint64_t, 4, 2)
+
+REGISTER_L12UB_SUB1(float, 5, 3)
+REGISTER_L12UB_SUB1(bfloat16_t, 5, 3)
+REGISTER_L12UB_SUB1(half, 5, 3)
+REGISTER_L12UB_SUB1(int8_t, 5, 3)
+REGISTER_L12UB_SUB1(uint8_t, 5, 3)
+REGISTER_L12UB_SUB1(int16_t, 5, 3)
+REGISTER_L12UB_SUB1(uint16_t, 5, 3)
+REGISTER_L12UB_SUB1(int32_t, 5, 3)
+REGISTER_L12UB_SUB1(uint32_t, 5, 3)
+REGISTER_L12UB_SUB1(int64_t, 5, 3)
+REGISTER_L12UB_SUB1(uint64_t, 5, 3)
 }

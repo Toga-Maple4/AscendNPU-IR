@@ -34,6 +34,8 @@
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 
+#include <cstdlib>
+
 namespace mlir {
 namespace hivm {
 
@@ -62,7 +64,8 @@ void canonicalizationHIVMPipeline(OpPassManager &pm) {
   pm.nest<func::FuncOp>().addPass(bishengir::createExtendedCanonicalizerPass());
   pm.nest<func::FuncOp>().addPass(createHIVMOptSinglePointPass());
   pm.nest<func::FuncOp>().addPass(bishengir::createExtendedCanonicalizerPass());
-  pm.nest<func::FuncOp>().addPass(memref::createDeadStoreEliminationPass());
+  if (!std::getenv("BISHENGIR_DISABLE_MEMREF_DSE"))
+    pm.nest<func::FuncOp>().addPass(memref::createDeadStoreEliminationPass());
 }
 
 static void
@@ -85,6 +88,10 @@ hivmNormSyncPipeline(OpPassManager &pm,
     }
     pm.nest<func::FuncOp>().addPass(createInjectSyncPass(syncOptions));
   }
+  // Refine existing cross-core events only after physical memory planning and
+  // local bank synchronization have established the complete safe schedule.
+  if (hivmPipelineOptions.enableProgramSplitMix)
+    pm.nest<func::FuncOp>().addPass(createProgramSplitL1ConsumerSyncPass());
 }
 
 static void
@@ -171,6 +178,7 @@ bufferizationPipeline(OpPassManager &pm,
   // resolveConflicts) can expose conflicts that were previously masked.
   pm.addPass(hivm::createTensorCopyInsertionPass(oneShotOptions));
   pm.addPass(bufferization::createOneShotBufferizePass(oneShotOptions));
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   canonicalizationHIVMPipeline(pm);
   if (hivmPipelineOptions.enableTritonKernelCompile) {
     // For triton kernels, bufferization will generate `memref.copy` ops,
@@ -282,7 +290,11 @@ static void hivmPreBufferizationOptimizationPipeline(
   // AutoBlockifyParallelLoopPass needs to be after infer core type because
   // num. of physical blocks we loop on is dependent on core type
   if (hivmPipelineOptions.enableTritonKernelCompile &&
-      hivmPipelineOptions.enableAutoBlockifyLoop) {
+      hivmPipelineOptions.enableProgramSplitMix) {
+    pm.addPass(createProgramSplitMixBlockifyPass());
+    pm.addPass(createProgramSplitL1MaterializePass());
+  } else if (hivmPipelineOptions.enableTritonKernelCompile &&
+             hivmPipelineOptions.enableAutoBlockifyLoop) {
     pm.addPass(createAutoBlockifyParallelLoopPass());
   }
 
@@ -330,6 +342,7 @@ static void hivmPreBufferizationOptimizationPipeline(
   // Partition after CV pipelining so it sees the IR cv-pipeline actually
   // emits.
   pm.addPass(createPartitionAndBindSubBlockPass());
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
 
   if (hivmPipelineOptions.enableUbufSaving) {
     pm.nest<func::FuncOp>().addPass(createCloneTensorEmptyPass());
@@ -374,6 +387,8 @@ static void hivmPreBufferizationOptimizationPipeline(
   pm.nest<func::FuncOp>().addPass(createHoistTightlyCoupledAllocPass());
   // Split mix kernel is done before bufferization because it depends on
   // tensor SSA property.
+  if (hivmPipelineOptions.enableTritonKernelCompile)
+    pm.nest<func::FuncOp>().addPass(createSplitMixedIfConditionalsPass());
   pm.addPass(createSplitMixKernelPass());
   if (enableRegisteredPreloadHeuristics(hivmPipelineOptions)) {
     MergeSamePreloadScopesOptions mergeOpts;
@@ -382,6 +397,8 @@ static void hivmPreBufferizationOptimizationPipeline(
         hivmPipelineOptions.setWorkspaceMultibuffer;
     pm.addPass(createMergeSamePreloadScopesPass(mergeOpts));
   }
+  if (hivmPipelineOptions.enableProgramSplitMix)
+    pm.nest<func::FuncOp>().addPass(createProgramSplitL1FinalizeSyncPass());
   pm.addPass(scope::createInlineScopePass());
   if (!hivmPipelineOptions.skipHIVMBindSubBlockPass) {
     TileAndBindSubBlockOptions tileOptions;
@@ -520,6 +537,7 @@ static void hivmPostBufferizationOptimizationPipeline(
   multiBufferOptions.gmMultiBufferNum = 1;
   pm.nest<func::FuncOp>().addPass(
       createMarkMultiBufferPass(multiBufferOptions));
+  pm.addPass(hivm::createLowerUBPlanReleasePass());
   PlanMemoryOptions planMemoryOption;
   planMemoryOption.enableMemoryDisplay =
       hivmPipelineOptions.enableMemoryDisplay;

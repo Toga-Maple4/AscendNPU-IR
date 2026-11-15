@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -327,6 +328,67 @@ LogicalResult LoadOp::verify() {
 
   return emitOpError("dst/src should be memref/memref or tensor/tensor, res "
                      "should be tensor!");
+}
+
+//===----------------------------------------------------------------------===//
+// L12UBOp layout interface
+//===----------------------------------------------------------------------===//
+// l12ub reads an NZ-formatted L1 (cbuf) source and writes an ND UB dest.
+// Declaring the source as an nZ layout anchor lets InferHIVMDataLayout
+// propagate nZ backward to the L1 buffer, which in turn rewrites the
+// feeding GM->L1 copy/load into an nd2nz (the same mechanism mmadL1 uses
+// for its L1 operands). Without this, the GM->L1 copy stays a plain
+// hivm.hir.load and the NZ layout is never established.
+static llvm::SmallVector<int64_t> getL12UBBlockSizes(mlir::Value oper) {
+  llvm::SmallVector<int64_t> blockSizes;
+  auto elementType = getElementTypeOrSelf(oper.getType());
+  size_t kBlockSize = utils::INTR_BYTES_PER_BLOCK /
+                      (elementType.getIntOrFloatBitWidth() / utils::kBitsToByte);
+  blockSizes.push_back(utils::FRACTAL_BLOCK_NUM);
+  blockSizes.push_back(static_cast<int64_t>(kBlockSize));
+  return blockSizes;
+}
+
+llvm::SmallDenseMap<Value, DataLayoutAttr> L12UBOp::getOperandsTargetLayout() {
+  llvm::SmallDenseMap<Value, DataLayoutAttr> valLayoutMap;
+  auto src = getSrc();
+  auto dst = getDst();
+  auto ndLayout =
+      DataLayoutAttr::get(getContext(), DataLayout::ND, nullptr, nullptr);
+  // 2-D L1 -> 2-D UB: ND->ND copy (copy_cbuf_to_ubuf / align path). Do not
+  // propagate nZ backward -- that would force nd2nz on the GM->L1 feeder.
+  if (isa<MemRefType>(src.getType()) && isa<MemRefType>(dst.getType())) {
+    auto srcRank = cast<MemRefType>(src.getType()).getRank();
+    auto dstRank = cast<MemRefType>(dst.getType()).getRank();
+    if (srcRank == 2 && dstRank == 2) {
+      valLayoutMap[src] = ndLayout;
+      valLayoutMap[dst] = ndLayout;
+      return valLayoutMap;
+    }
+  }
+  // 4-D NZ L1 -> 2-D ND UB: fractal NZ->ND (legacy cube/dot path).
+  if (isa<MemRefType>(src.getType())) {
+    auto blockSizes = getL12UBBlockSizes(src);
+    valLayoutMap[src] = DataLayoutAttr::get(
+        getContext(), DataLayout::nZ, nullptr,
+        mlir::DenseI64ArrayAttr::get(getContext(), ArrayRef(blockSizes)));
+  }
+  if (isa<MemRefType>(dst.getType()))
+    valLayoutMap[dst] = ndLayout;
+  return valLayoutMap;
+}
+
+llvm::SmallDenseMap<Value, DataLayoutAttr> L12UBOp::getOperandsCurrentLayout() {
+  llvm::SmallDenseMap<Value, DataLayoutAttr> valLayoutMap;
+  auto src = getSrc();
+  if (isa<MemRefType>(src.getType()))
+    valLayoutMap[src] =
+        DataLayoutAttr::get(getContext(), DataLayout::ND, nullptr, nullptr);
+  auto dst = getDst();
+  if (isa<MemRefType>(dst.getType()))
+    valLayoutMap[dst] =
+        DataLayoutAttr::get(getContext(), DataLayout::ND, nullptr, nullptr);
+  return valLayoutMap;
 }
 
 //===----------------------------------------------------------------------===//

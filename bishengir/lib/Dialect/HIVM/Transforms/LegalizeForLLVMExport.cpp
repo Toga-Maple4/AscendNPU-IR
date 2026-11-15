@@ -180,7 +180,7 @@ struct LowerBlockSetWaitToIntraBlockSetWait {
                              Location loc) {
     Value offsetConstant = rewriter.create<LLVM::ConstantOp>(
         loc, rewriter.getI64Type(),
-        rewriter.getI64IntegerAttr(util::INTRA_BLOCK_FLAG_ID_OFFSET));
+        rewriter.getI64IntegerAttr(util::intraBlockFlagForSubcore(0, 1)));
     Value newValue =
         rewriter.create<LLVM::AddOp>(loc, originalFlagId, offsetConstant);
     return newValue;
@@ -205,7 +205,7 @@ struct LowerBlockSetWaitToIntraBlockSetWait {
     if (flagId.has_value()) {
       if (core == TCoreType::CUBE) {
         rewriter.create<ImmT>(
-            loc, pipeVal, flagId.value() + util::INTRA_BLOCK_FLAG_ID_OFFSET);
+            loc, pipeVal, util::intraBlockFlagForSubcore(flagId.value(), 1));
       }
       auto result = rewriter.create<ImmT>(loc, pipeVal, flagId.value());
       rewriter.replaceOp(convertOp, result);

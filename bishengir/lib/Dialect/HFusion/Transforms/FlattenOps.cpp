@@ -103,7 +103,16 @@ void FlattenOpsPass::runOnOperation() {
   if (!util::shouldApplyFlattenOpsPass(funcOp))
     return;
 
-  if (this->flattenMode == FlattenMode::Greedy) {
+  // The split New-L1 consumer retains two-dimensional DMA/store boundaries.
+  // Flatten elementwise computation locally, restoring its shape at those
+  // boundaries instead of propagating their layout constraints through compute.
+  bool flattenSplitConsumer =
+      this->registerBased && !(hacc::utils::isHost(funcOp) && this->skipHost) &&
+      hivm::queryFuncCoreType(funcOp) == hivm::TFuncCoreType::AIV &&
+      funcOp->hasAttr(hivm::TPartOfMixAttr::name) &&
+      funcOp->hasAttr("program_split.transformed") &&
+      !util::hasUnpropagateableCase(funcOp, this->skipScope);
+  if (this->flattenMode == FlattenMode::Greedy || flattenSplitConsumer) {
     RewritePatternSet patterns(&getContext());
     populateFlattenOpsPattern(patterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns))))

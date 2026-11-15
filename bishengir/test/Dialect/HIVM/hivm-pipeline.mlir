@@ -1,5 +1,11 @@
 // RUN: bishengir-opt -hacc-append-device-spec=target=Ascend910B1 -optimize-hivm-pipeline="tile-mix-cube-loop=1 tile-mix-vector-loop=1" %s | FileCheck %s
 // RUN: bishengir-opt -hacc-append-device-spec=target=Ascend910B1 -optimize-hivm-pipeline="enable-hivm-inject-barrier-all-sync=true tile-mix-cube-loop=1 tile-mix-vector-loop=1" %s | FileCheck %s -check-prefix=CHECK-BAR-ALL
+// RUN: bishengir-opt -hacc-append-device-spec=target=Ascend910B1 -optimize-hivm-pipeline="enable-triton-kernel-compile=true" -dump-pass-pipeline %s -o /dev/null 2>&1 | FileCheck %s -check-prefix=CHECK-TRITON-PIPELINE
+// RUN: bishengir-opt -hacc-append-device-spec=target=Ascend910B1 -optimize-hivm-pipeline -dump-pass-pipeline %s -o /dev/null 2>&1 | FileCheck %s -check-prefix=CHECK-NONTRITON-PIPELINE
+
+// CHECK-TRITON-PIPELINE: func.func(hivm-split-mixed-if-conditionals),hivm-split-mix-kernel
+// CHECK-NONTRITON-PIPELINE: Pass Manager with
+// CHECK-NONTRITON-PIPELINE-NOT: hivm-split-mixed-if-conditionals
 
 module {
 // CHECK: hivm.hir.set_mask_norm
