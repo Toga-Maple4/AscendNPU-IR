@@ -1,8 +1,8 @@
 // Load order deliberately differs from the ABI. IDs, banks and delivery order
 // follow ABI input order; the first load therefore has selected-input ID 1.
 // This is a compiler/runtime fixture, not a benchmark workload override.
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s --check-prefix=IDS
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s --check-prefix=CONTRACT
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s --check-prefix=IDS
+// RUN: bishengir-opt %s --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s --check-prefix=CONTRACT
 // RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --limit-auto-multi-buffer-of-local-buffer=no-limit --enable-auto-blockify-loop=true --enable-auto-bind-sub-block=true --enable-vf-merge-level=1 --enable-program-split-mix=true --disable-ffts -o %t.kernel
 // RUN: FileCheck %s --check-prefix=EXTERNAL < %t.kernel.program_split.json
 // EXTERNAL: "kind":"split_mix_half_grid"

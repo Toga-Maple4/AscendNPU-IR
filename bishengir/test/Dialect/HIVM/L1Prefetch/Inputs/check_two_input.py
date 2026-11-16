@@ -10,25 +10,27 @@ def contract(text):
 def run(text, *passes):
     return subprocess.check_output([opt, *passes], input=text, text=True)
 def two_input(text):
-    return run(contract(text), "--l1-prefetch-ps-analysis")
+    return run(contract(text), "--l1-prefetch-analyze")
 bwd = two_input(backward_source)
 assert "l1_prefetch_ps.accepted" in bwd and "l1_prefetch_ps.proof" in bwd, bwd
 assert "plan_version" not in bwd
 assert bwd.count("program_split.selected_input") == 2
 for id in (0, 1):
     assert f"program_split.selected_input = {id} : i32" in bwd
-assert run(bwd, "--l1-prefetch-ps-analysis") == bwd
+assert run(bwd, "--l1-prefetch-analyze") == bwd
 unmarked = re.sub(r'^.*annotation.mark.*program_split.selected_input.*\n', '', bwd, flags=re.M)
+# Facts contain only scalar references/literals, never an expression graph.
+unmarked = re.sub(r'l1_prefetch_ps\.(?:facts|value_roles) = \{(?:[^{}]|\{[^{}]*\})*\},? ?', '', unmarked)
 unmarked = re.sub(r'l1_prefetch_ps\.\w+(?: = "[^"]*")?,? ?', '', unmarked)
 unmarked = unmarked.replace(', }', '}').replace(' attributes {}', '').replace(' {}', '')
 assert run(unmarked) == run(contract(backward_source)), "analysis changed executable IR"
-transformed = run(bwd, "--l1-prefetch-ps-transform")
+transformed = run(bwd, "--l1-prefetch-normalize")
 for field in ("input_args = array<i32: 2, 3>", "output_arg = 4", "stride_arg = 5", "element_bits = 16"):
     assert field in transformed, field
 assert "plan_version" not in transformed and "l1_prefetch_ps.proof" not in transformed
 for text in (contract(backward_source), bwd.replace('program_split.selected_input = 1', 'program_split.selected_input = 0'),
              bwd.replace('arith.mulf', 'arith.addf', 1), bwd.replace('Ascend950PR_9589', 'Ascend950PR_9579')):
-    failed = subprocess.run([opt, "--l1-prefetch-ps-transform"], input=text, text=True, capture_output=True)
+    failed = subprocess.run([opt, "--l1-prefetch-normalize"], input=text, text=True, capture_output=True)
     assert failed.returncode and "L1 pipeline error:" in failed.stderr, failed.stderr
 for name, text, reason in [
     ("stride_mismatch", backward_source.replace("strides: [%10, 1]", "strides: [%9, 1]", 1), "nested_unproved_store_partition"),
@@ -56,7 +58,7 @@ for dtype in ("f16", "bf16", "f32"):
                 source = re.sub(re.escape(match.group(1)) + r"(?![\w])", match.group(2), source)
         accepted = two_input(source)
         assert "l1_prefetch_ps.accepted" in accepted, (dtype, columns, accepted)
-        transformed = run(accepted, "--l1-prefetch-ps-transform")
+        transformed = run(accepted, "--l1-prefetch-normalize")
         assert f"element_bits = {32 if dtype == 'f32' else 16}" in transformed
         assert f"tile_cols = {columns}" in transformed
 # Larger aligned tiles are semantically legal; the physical planner owns capacity.

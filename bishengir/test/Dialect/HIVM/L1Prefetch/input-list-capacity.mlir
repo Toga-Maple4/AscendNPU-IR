@@ -3,7 +3,7 @@
 // 512 KiB. Early feasibility must use the same target facts as the pipeline.
 // Semantic analysis accepts the access pattern; the shared reservation query
 // rejects L1 realization; the approved ordinary MB-off fallback must succeed.
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s --check-prefix=ANALYSIS
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s --check-prefix=ANALYSIS
 // RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts -o %t.external.o 2>&1 | FileCheck %s --check-prefix=REJECT
 // RUN: python3 %S/../../../bishengir-compile/Inputs/check_l1_ordinary_fallback.py %t.external.o l1_reservation_exceeds_capacity
 // ANALYSIS: l1_prefetch_ps.accepted

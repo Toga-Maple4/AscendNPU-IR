@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s
 // CHECK: l1_prefetch_ps.accepted
 // CHECK: memref<32x1024xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {

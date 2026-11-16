@@ -145,6 +145,12 @@ load_gm_to_cbuf_2d_program_split_core(memref_t<__gm__ T, 2> *src,
   // DMA helper can select a colliding implementation from the stock bitcode.
   // A5 align-v2 uses byte lengths and full row strides. Keep the selected
   // region unchanged: gaps in GM are skipped and L1 rows retain their layout.
+  // The GM stride is byte-granular (AscendC DataCopyPad GM->L1); only the
+  // destination row stride needs L1 alignment. An unaligned GM pitch does not
+  // require separate row copies when the transferred row length is aligned.
+  // The initial GM-base check below is conservative: the intrinsic accepts
+  // byte-aligned GM addresses, including later burst chunks. L1 addresses must
+  // stay 32-byte aligned, which the destination stride guarantees per chunk.
   const int64_t row_bytes = src->sizes[1] * sizeof(T);
   const int64_t src_row_bytes = src->strides[0] * sizeof(T);
   const int64_t dst_row_bytes = dst->strides[0] * sizeof(T);
@@ -154,7 +160,6 @@ load_gm_to_cbuf_2d_program_split_core(memref_t<__gm__ T, 2> *src,
       src->strides[1] == 1 && dst->strides[1] == 1 &&
       row_bytes > 0 && row_bytes % L1_ALIGN_BYTES == 0 &&
       src_row_bytes >= row_bytes && dst_row_bytes >= row_bytes &&
-      src_row_bytes % L1_ALIGN_BYTES == 0 &&
       dst_row_bytes % L1_ALIGN_BYTES == 0 &&
       row_bytes <= max_length_or_dst_stride &&
       src_row_bytes <= max_src_stride &&

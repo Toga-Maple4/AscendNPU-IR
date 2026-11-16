@@ -13,7 +13,7 @@ def run(text, *passes):
 # Two inputs must both arrive before their consumer is published. The reduced
 # schedule uses the same operand twice to exercise ordering, not memory layout.
 two = re.sub(r'^(\s*hivm.hir.l12ub[^\n]*)$', r'\1\n\1', source, flags=re.M)
-result = run(two, '--program-split-l1-consumer-sync')
+result = run(two, '--l1-prefetch-consumer-handoff')
 assert result.returncode == 0, result.stderr
 lines = result.stdout.splitlines()
 groups = 0
@@ -28,7 +28,7 @@ assert groups == 4, groups  # Two consumers in each parity branch.
 # Ordinary/legacy functions are untouched.
 ordinary = source.replace('program_split.transformed, ', '')
 plain = run(ordinary)
-unchanged = run(ordinary, '--program-split-l1-consumer-sync')
+unchanged = run(ordinary, '--l1-prefetch-consumer-handoff')
 assert unchanged.returncode == 0 and unchanged.stdout == plain.stdout
 
 for bad in (
@@ -38,6 +38,6 @@ for bad in (
     source.replace('hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = 2', ''),
     re.sub(r'^\s*hivm.hir.sync_block_set[^\n]*', '', source, flags=re.M),
 ):
-    failed = run(bad, '--program-split-l1-consumer-sync')
+    failed = run(bad, '--l1-prefetch-consumer-handoff')
     assert failed.returncode != 0 and 'L1 consumer sync:' in failed.stderr, failed.stderr
 print('PASS: two-input ordering, ordinary path, and malformed schedule rejection')

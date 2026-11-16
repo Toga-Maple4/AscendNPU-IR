@@ -4,14 +4,14 @@ from pathlib import Path
 source=Path(sys.argv[1]).read_text()
 opt=sys.argv[2]
 def analyze(text, reason=None):
-    p=subprocess.run([opt,'--l1-prefetch-ps-analysis'],input=text,text=True,capture_output=True)
+    p=subprocess.run([opt,'--l1-prefetch-analyze'],input=text,text=True,capture_output=True)
     assert p.returncode==0,p.stderr
     if reason:
         assert f'l1_prefetch_ps.reject_reason = "{reason}"' in p.stdout,p.stdout
         assert 'program_split.selected_input' not in p.stdout,p.stdout
     else:
         assert 'l1_prefetch_ps.accepted' in p.stdout,p.stdout
-        q=subprocess.run([opt,'--l1-prefetch-ps-transform'],input=p.stdout,text=True,capture_output=True)
+        q=subprocess.run([opt,'--l1-prefetch-normalize'],input=p.stdout,text=True,capture_output=True)
         assert q.returncode==0,q.stderr
         assert 'flat_tile = 1' in q.stdout and 'pair_stride = 28' in q.stdout,q.stdout
         assert q.stdout.count('hivm.hir.load')==2,q.stdout

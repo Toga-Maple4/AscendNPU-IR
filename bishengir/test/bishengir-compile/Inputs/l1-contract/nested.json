@@ -44,5 +44,13 @@
     "disable_vf_reachable_check": false,
     "hfusion_max_buffer_count_tuning": 0,
     "enable_auto_multi_buffer": false
+  },
+  "profitability": {
+    "version": 2,
+    "threshold": 40,
+    "decision": "passed",
+    "reason": "compute_score_at_least_40",
+    "inputs": 1,
+    "compute_score": 184
   }
 }

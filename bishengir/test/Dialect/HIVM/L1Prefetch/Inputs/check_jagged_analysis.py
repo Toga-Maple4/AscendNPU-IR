@@ -8,7 +8,7 @@ opt, path = sys.argv[1:]
 source = Path(path).read_text()
 
 def run(text, analyze=False):
-    return subprocess.check_output([opt] + (["--l1-prefetch-ps-analysis"] if analyze else []), input=text, text=True)
+    return subprocess.check_output([opt] + (["--l1-prefetch-analyze"] if analyze else []), input=text, text=True)
 
 def reject(name, old, new, reason):
     assert old in source, name
@@ -23,6 +23,8 @@ actual = run(source, True)
 assert 'l1_prefetch_ps.accepted' in actual, actual
 assert actual.count('program_split.selected_input') == 1
 unmarked = re.sub(r'^.*annotation.mark.*program_split.selected_input.*\n', '', actual, flags=re.M)
+# Facts contain only scalar references/literals, never an expression graph.
+unmarked = re.sub(r'l1_prefetch_ps\.(?:facts|value_roles) = \{(?:[^{}]|\{[^{}]*\})*\},? ?', '', unmarked)
 unmarked = re.sub(r'l1_prefetch_ps\.\w+(?: = "[^"]*")?,? ?', '', unmarked)
 unmarked = unmarked.replace(', }', '}').replace(' attributes {}', '').replace(' {}', '')
 assert run(unmarked) == run(source), 'analysis mutated executable IR'
@@ -44,7 +46,7 @@ reject('preexisting plan', 'mix_mode = "aiv"',
 
 # The transform consumes a clone-stable proof and retires it before lowering.
 transformed = subprocess.check_output(
-    [opt, "--l1-prefetch-ps-transform"], input=actual, text=True)
+    [opt, "--l1-prefetch-normalize"], input=actual, text=True)
 assert 'program_split.transformed' in transformed
 assert 'jagged_copy = 1 : i32' in transformed
 assert transformed.count('program_split.metadata') == 2
@@ -58,7 +60,7 @@ for name, text in [
     ('stale executable', actual.replace('arith.minsi', 'arith.maxsi', 1)),
     ('stale marker', actual.replace('l1_prefetch_ps.rows', 'l1_prefetch_ps.wrong_rows')),
 ]:
-    result = subprocess.run([opt, "--l1-prefetch-ps-transform"],
+    result = subprocess.run([opt, "--l1-prefetch-normalize"],
                             input=text, text=True, capture_output=True)
     assert result.returncode != 0, name
     assert 'missing, stale or inconsistent accepted analysis metadata' in result.stderr, result.stderr
@@ -78,7 +80,7 @@ print('PASS padding/copy ordering')
 # Physical pairing uses the generated target specification, not a host guess.
 for target, cores in [('Ascend950PR_9579', 28), ('Ascend950PR_9589', 32)]:
     accepted = run(source.replace('Ascend950PR_9579', target), True)
-    normalized = subprocess.check_output([opt, '--l1-prefetch-ps-transform'],
+    normalized = subprocess.check_output([opt, '--l1-prefetch-normalize'],
                                          input=accepted, text=True)
     assert f'pair_stride = {cores} : i32' in normalized
     print('PASS target pair stride', target, cores)

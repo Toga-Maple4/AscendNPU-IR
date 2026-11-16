@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s --check-prefix=ACCEPT
+// RUN: bishengir-opt %s --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s --check-prefix=ACCEPT
 //
 // Real direct GELU TTAdapter input. Triton-Ascend owns the whole-program
 // semantic decision and emits the backend contract plus selected-input marker.

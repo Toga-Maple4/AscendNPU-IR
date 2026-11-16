@@ -112,7 +112,17 @@ void FlattenOpsPass::runOnOperation() {
       funcOp->hasAttr(hivm::TPartOfMixAttr::name) &&
       funcOp->hasAttr("program_split.transformed") &&
       !util::hasUnpropagateableCase(funcOp, this->skipScope);
-  if (this->flattenMode == FlattenMode::Greedy || flattenSplitConsumer) {
+  // Whole-program New-L1 also carries reductions. Greedily flattening only
+  // their elementwise producers inserts a reshape at the reduction boundary,
+  // breaking VF fusion and materializing a full-sized UB intermediate. Keep
+  // the existing dimension-aware path for these consumers.
+  bool hasReduction = false;
+  if (flattenSplitConsumer)
+    funcOp.walk([&](linalg::LinalgOp op) {
+      hasReduction |= op.getNumReductionLoops() != 0;
+    });
+  if (this->flattenMode == FlattenMode::Greedy ||
+      (flattenSplitConsumer && !hasReduction)) {
     RewritePatternSet patterns(&getContext());
     populateFlattenOpsPattern(patterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns))))

@@ -1,0 +1,60 @@
+{
+  "schema_version": 2,
+  "profitability": {
+    "version": 2,
+    "threshold": 40,
+    "decision": "unknown",
+    "reason": "unknown_operation_cost",
+    "inputs": 2,
+    "compute_score": null
+  },
+  "kind": "split_mix_half_grid",
+  "guard": {
+    "kind": "program_tiles",
+    "roles": {
+      "input_strides": [
+        {
+          "arg": 7,
+          "type": "i32"
+        },
+        {
+          "arg": 9,
+          "type": "i32"
+        }
+      ],
+      "inputs": [
+        {
+          "arg": 2,
+          "type": "*bf16"
+        },
+        {
+          "arg": 3,
+          "type": "*bf16"
+        }
+      ],
+      "output": {
+        "arg": 4,
+        "type": "*bf16"
+      }
+    },
+    "tile": {
+      "cols": 128,
+      "element_bits": 16,
+      "rows": 256
+    },
+    "tile_mode": "partial"
+  },
+  "launch": {
+    "allow_odd_grid": true,
+    "distribution": "resident_pairs",
+    "logical_grid": "xyz",
+    "resident_stride": 28
+  },
+  "target": "Ascend950PR_9579",
+  "compile_options": {
+    "enable_vf_fusion": true,
+    "disable_vf_reachable_check": false,
+    "hfusion_max_buffer_count_tuning": 0,
+    "enable_auto_multi_buffer": false
+  }
+}

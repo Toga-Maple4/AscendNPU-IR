@@ -8,7 +8,7 @@ opt, path = sys.argv[1:]
 source = Path(path).read_text()
 
 def run(text, sync=False):
-    return subprocess.run([opt] + (["--program-split-l1-consumer-sync"] if sync else []),
+    return subprocess.run([opt] + (["--l1-prefetch-consumer-handoff"] if sync else []),
                           input=text, text=True, capture_output=True)
 
 ordinary = run(source)

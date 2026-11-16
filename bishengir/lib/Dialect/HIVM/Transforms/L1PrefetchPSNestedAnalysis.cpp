@@ -5,7 +5,9 @@
  * This pass only annotates. The accepted retry normalizes the proved loops;
  * the launcher enforces the runtime premises derived from the accepted IR.
  */
-#include "L1PrefetchPSRoles.h"
+#include "L1PrefetchPSAddress.h"
+#include "L1PrefetchPSFacts.h"
+#include "L1PrefetchPSProgram.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/Transforms/L1PrefetchPS.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -62,7 +64,8 @@ std::string analyzeFlatInputs(
     ArrayRef<memref::ReinterpretCastOp> bases,
     ArrayRef<bufferization::ToTensorOp> tensors,
     MutableArrayRef<bufferization::MaterializeInDestinationOp> stores,
-    ArrayRef<tensor::ExtractSliceOp> slices, bool disallowed) {
+    ArrayRef<tensor::ExtractSliceOp> slices, bool disallowed,
+    EffectInventory &inventory) {
   unsigned inputs = copies.size();
   if (disallowed || inputs < 1 || allocs.size() != inputs ||
       tensors.size() != inputs || ifs.size() != inputs ||
@@ -84,9 +87,10 @@ std::string analyzeFlatInputs(
                   : memref::ReinterpretCastOp();
   if (!base || base.getOffsets().size() != 1 || first.getSizes().size() != 1)
     return "flat_unproved_input_partition";
+  AddressEquivalence equality;
   Value offset = base.getOffsets().front(), size = first.getSizes().front();
   auto cast = offset.getDefiningOp<arith::IndexCastOp>();
-  if (!cast || !mulOf(cast.getIn(), layout.programId(), elements))
+  if (!cast || !equality.product(cast.getIn(), layout.programId(), elements))
     return "flat_unproved_program_ownership";
   AccessRoles roles;
   auto roleError = deriveAccessRoles(func, layout, AccessSchedule::Flat, copies,
@@ -100,7 +104,7 @@ std::string analyzeFlatInputs(
     auto b = view.getSource().getDefiningOp<memref::ReinterpretCastOp>();
     auto arg = b ? dyn_cast<BlockArgument>(b.getSource()) : BlockArgument();
     if (!arg || !layout.isPublic(arg) || b.getOffsets().size() != 1 ||
-        b.getOffsets().front() != offset ||
+        !equality.equal(b.getOffsets().front(), offset) ||
         b.getStaticSizes() != tile.getShape() ||
         b.getStaticStrides().size() != 1 || b.getStaticStrides()[0] != 1)
       return false;
@@ -156,6 +160,8 @@ std::string analyzeFlatInputs(
       } else if (user != dst.getOperation())
         return "flat_unproved_selected_input";
     }
+    if (!initializationPrecedesRead(padding, copy, tensor))
+      return "flat_unproved_initialization_order";
     auto cmp = padding ? padding.getCondition().getDefiningOp<arith::CmpIOp>()
                        : arith::CmpIOp();
     if (!tensor || !cmp || cmp.getPredicate() != arith::CmpIPredicate::slt ||
@@ -163,7 +169,11 @@ std::string analyzeFlatInputs(
         !hasUnobservablePadding(tensor, slice, stores.front(), func))
       return "flat_observable_or_unproved_padding";
   }
+  if (!hasStagingEffects(func, inventory, ifs))
+    return "unmodelled_memory_dependency";
   OpBuilder b(func.getContext());
+  if (failed(publishAcceptedFacts(func, {AccessSchedule::Flat, roles, {}, {}, {}})))
+    return "inconsistent_accepted_facts";
   func->setAttr("l1_prefetch_ps.flat", b.getUnitAttr());
   for (auto entry : llvm::enumerate(copies)) {
     auto copy = entry.value();
@@ -196,7 +206,7 @@ std::string analyzeNestedInputs(func::FuncOp func, KernelLayout &layout,
   auto &stores = inventory.stores;
   auto &slices = inventory.slices;
   unsigned inputs = copies.size();
-  if (!inventory.supports(OperationProfile::Elementwise) || !inputs ||
+  if (inventory.hasUnsupportedOperation() || !inputs ||
       loops.size() != 2 || ifs.size() != inputs || allocs.size() != inputs ||
       views.size() != 2 * inputs + 1 || bases.size() != inputs + 1 ||
       tensors.size() != inputs || stores.size() != 1 || slices.size() != 1)
@@ -355,6 +365,8 @@ std::string analyzeNestedInputs(func::FuncOp func, KernelLayout &layout,
                           tensor.getOperation(), padding.getOperation()})
       if (op->getParentOp() != inner)
         return "nested_unsupported_memory_or_control_flow";
+    if (!initializationPrecedesRead(padding, copy, tensor))
+      return "nested_unproved_initialization_order";
     // Full-tile mode proves padding unreachable from constant bounds. Partial
     // mode additionally needs elementwise independence for each selected input.
     if (nestedTileMode(accessRoles, tile) == NestedTileMode::Partial &&
@@ -373,7 +385,11 @@ std::string analyzeNestedInputs(func::FuncOp func, KernelLayout &layout,
   });
   if (extraWrite)
     return "nested_unproved_selected_input";
+  if (!hasStagingEffects(func, inventory, ifs))
+    return "unmodelled_memory_dependency";
   OpBuilder builder(func.getContext());
+  if (failed(publishAcceptedFacts(func, {AccessSchedule::Nested, accessRoles, {}, {}, {}})))
+    return "inconsistent_accepted_facts";
   outer->setAttr("l1_prefetch_ps.outer", builder.getUnitAttr());
   inner->setAttr("l1_prefetch_ps.inner", builder.getUnitAttr());
   for (auto copy : copies)
@@ -397,10 +413,15 @@ std::string mlir::hivm::analyzeNestedTileCandidate(func::FuncOp func,
                                                  KernelLayout &layout,
                                                  EffectInventory &inventory) {
   if (inventory.loops.empty())
+    if (llvm::any_of(inventory.allocs, [](auto alloc) {
+          return alloc.getType().getRank() == 2;
+        }))
+      return analyzeProgramInputs(func, layout, inventory);
+  if (inventory.loops.empty())
     return analyzeFlatInputs(func, layout, inventory.ifs, inventory.copies,
                              inventory.allocs, inventory.views, inventory.bases,
                              inventory.tensors, inventory.stores,
                              inventory.slices,
-                             !inventory.supports(OperationProfile::Elementwise));
+                             inventory.hasUnsupportedOperation(), inventory);
   return analyzeNestedInputs(func, layout, inventory);
 }

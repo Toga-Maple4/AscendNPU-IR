@@ -91,7 +91,7 @@ hivmNormSyncPipeline(OpPassManager &pm,
   // Refine existing cross-core events only after physical memory planning and
   // local bank synchronization have established the complete safe schedule.
   if (hivmPipelineOptions.enableProgramSplitMix)
-    pm.nest<func::FuncOp>().addPass(createProgramSplitL1ConsumerSyncPass());
+    pm.nest<func::FuncOp>().addPass(createL1PrefetchConsumerHandoffPass());
 }
 
 static void
@@ -291,8 +291,8 @@ static void hivmPreBufferizationOptimizationPipeline(
   // num. of physical blocks we loop on is dependent on core type
   if (hivmPipelineOptions.enableTritonKernelCompile &&
       hivmPipelineOptions.enableProgramSplitMix) {
-    pm.addPass(createProgramSplitMixBlockifyPass());
-    pm.addPass(createProgramSplitL1MaterializePass());
+    pm.addPass(createL1PrefetchMapProgramsPass());
+    pm.addPass(createL1PrefetchMaterializePass());
   } else if (hivmPipelineOptions.enableTritonKernelCompile &&
              hivmPipelineOptions.enableAutoBlockifyLoop) {
     pm.addPass(createAutoBlockifyParallelLoopPass());
@@ -398,7 +398,7 @@ static void hivmPreBufferizationOptimizationPipeline(
     pm.addPass(createMergeSamePreloadScopesPass(mergeOpts));
   }
   if (hivmPipelineOptions.enableProgramSplitMix)
-    pm.nest<func::FuncOp>().addPass(createProgramSplitL1FinalizeSyncPass());
+    pm.nest<func::FuncOp>().addPass(createL1PrefetchBalanceSyncPass());
   pm.addPass(scope::createInlineScopePass());
   if (!hivmPipelineOptions.skipHIVMBindSubBlockPass) {
     TileAndBindSubBlockOptions tileOptions;

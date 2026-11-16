@@ -1,7 +1,7 @@
 // Generated from the real GELU backward pre-materialization compiler dump.
 // Two-input schedule: eight 64 KiB L1 banks and two private input buffers;
 // both inputs delivered before unchanged math, plural final-reader metadata.
-// RUN: bishengir-opt %s -program-split-l1-materialize | FileCheck %s
+// RUN: bishengir-opt %s -l1-prefetch-materialize | FileCheck %s
 
 // CHECK-LABEL: func.func @_gelu_bwd_kernel
 // CHECK-COUNT-8: memref.alloc() : memref<16x2048xf16, #hivm.address_space<cbuf>>

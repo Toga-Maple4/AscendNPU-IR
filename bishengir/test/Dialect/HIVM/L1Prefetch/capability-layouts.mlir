@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s
 // Unit fixtures preserving the access proofs while varying public roles.
 
 // CHECK-LABEL: func.func @constant_rows

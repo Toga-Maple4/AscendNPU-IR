@@ -488,6 +488,7 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
     (void)llvm::sys::fs::remove(splitResultPath);
   bool acceptedProgramSplit = false;
   bool candidateAccepted = false;
+  hivm::L1PrefetchPSProfitability profitability;
   OwningOpRef<ModuleOp> candidateModule;
   DictionaryAttr candidateRuntimeContract;
   DictionaryAttr candidateExternalContract;
@@ -506,7 +507,7 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
       candidateModule = OwningOpRef<ModuleOp>(mod.clone());
       if (failed(runPipeline(*candidateModule,
           [](mlir::PassManager &pm) {
-            pm.addPass(hivm::createL1PrefetchPSAnalysisPass());
+            pm.addPass(hivm::createL1PrefetchAnalyzePass());
           }, config, "L1-semantic-analysis")))
         return failure();
       auto entry = hivm::getL1PrefetchPSEntry(*candidateModule);
@@ -515,6 +516,7 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
       } else {
         candidateAccepted = entry->hasAttr("l1_prefetch_ps.accepted");
         if (candidateAccepted) {
+          profitability = hivm::getL1PrefetchPSProfitability(entry);
           std::string interfaceReason;
           auto targetSpec = hacc::utils::getNPUTargetSpecAttr(
               entry.getContext(), requestedConfig.getTarget(), entry.getLoc());
@@ -570,6 +572,17 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
       llvm::json::OStream json(result);
       json.object([&] {
         json.attribute("schema_version", 2);
+        json.attributeObject("profitability", [&] {
+          json.attribute("version", 2);
+          json.attribute("threshold", 40);
+          json.attribute("decision", profitability.decision());
+          json.attribute("reason", profitability.reason);
+          json.attribute("inputs", profitability.inputs);
+          if (profitability.score)
+            json.attribute("compute_score", *profitability.score);
+          else
+            json.attribute("compute_score", nullptr);
+        });
         json.attribute("kind", acceptedProgramSplit ? "split_mix_half_grid" : "ordinary");
         if (acceptedProgramSplit) {
           // One serializer for all runtime contract kinds. Physical realization
@@ -723,6 +736,10 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
     collectedDiagnostics.resize(probeStart);
     if (!provenSelectedExcess)
       return false;
+    if (profitability.filtered()) {
+      llvm::errs() << "[program-split] filtered: compute_score_below_40\n";
+      return false;
+    }
 
     llvm::errs() << "[program-split] trying New-L1 after selected-capacity proof\n";
     BiShengIRCompileMainConfig splitConfig = requestedConfig;
@@ -735,7 +752,7 @@ runProgramSplitRegBasePipeline(ModuleOp mod, BiShengIRCompileMainConfig config) 
     const size_t splitStart = collectedDiagnostics.size();
     // A transform failure means an invalid/stale proof, not a capacity reject.
     if (failed(splitPm.runOnce(*split, [](mlir::PassManager &pm) {
-          pm.addPass(hivm::createL1PrefetchPSTransformPass());
+          pm.addPass(hivm::createL1PrefetchNormalizePass());
         }, "L1-transform")))
       return failure();
     // The acceptance fingerprint binds module attributes: add the physical

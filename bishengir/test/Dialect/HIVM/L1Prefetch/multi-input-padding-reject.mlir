@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s
 // CHECK: l1_prefetch_ps.reject_reason = "nested_unproved_padding_independence"
 // CHECK-NOT: program_split.selected_input
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {

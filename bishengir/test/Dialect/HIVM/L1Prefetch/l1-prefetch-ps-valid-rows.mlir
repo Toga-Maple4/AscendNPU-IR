@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --program-split-l1-materialize --canonicalize | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-materialize --canonicalize | FileCheck %s
 // RUN: python3 %S/Inputs/check_valid_rows.py bishengir-opt %s
 // A selected single-input elementwise tile with partial rows and columns.
 // Live-row delivery is derived from the selected source, without a kernel-family

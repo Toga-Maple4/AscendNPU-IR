@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze | FileCheck %s
 
 // The common ABI proof runs before choosing an ownership matcher. A hidden
 // pointer with an incompatible type cannot be treated as a public tensor.

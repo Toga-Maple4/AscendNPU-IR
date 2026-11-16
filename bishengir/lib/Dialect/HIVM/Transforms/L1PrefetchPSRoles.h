@@ -6,17 +6,17 @@
 
 namespace mlir::hivm::l1prefetch {
 
-enum class AccessSchedule { Persistent, Nested, Flat, Jagged };
+enum class AccessSchedule { Persistent, Nested, Flat, Jagged, Program };
 
-// A transient view of SSA, not a serialized plan. Derivation identifies
-// operands; the schedule's ownership proof must still establish their meaning.
-// Consumers after analysis may use this only on the digest-verified pristine
-// clone.
+// Analysis derives these operands and proves their meaning. AcceptedFacts
+// records only those proved roles; consumers decode them on the digest-verified
+// pristine clone. This transient view never survives normalization or cloning.
 struct AccessRoles {
   SmallVector<BlockArgument> inputs;
   BlockArgument output, offsets;
   Value rows, cols, size, inputStride, matrixStride;
   OpFoldResult stride;
+  SmallVector<OpFoldResult> inputStrides;
 };
 
 // Partial tiles are the general case, independent of input count. Elide live
@@ -97,6 +97,25 @@ deriveAccessRoles(func::FuncOp func, KernelLayout &layout,
   llvm::sort(roles.inputs, [](BlockArgument a, BlockArgument b) {
     return a.getArgNumber() < b.getArgNumber();
   });
+  if (schedule == AccessSchedule::Program) {
+    for (BlockArgument input : roles.inputs) {
+      auto view = *llvm::find_if(inputViews, [&](auto v) {
+        return v.getSource() == input;
+      });
+      auto strides = view.getMixedStrides();
+      if (strides.size() != 2)
+        return "unmodelled_access_dependency";
+      OpFoldResult stride = strides.front();
+      if (auto value = dyn_cast<Value>(stride)) {
+        value = roleValue(value);
+        if (!scalarRole(value, layout))
+          return "unmodelled_access_dependency";
+        stride = value;
+      }
+      roles.inputStrides.push_back(stride);
+    }
+    return "";
+  }
   if (schedule == AccessSchedule::Flat) {
     auto firstLoad = loads.front();
     auto slice = firstLoad.getSource().getDefiningOp<memref::SubViewOp>();

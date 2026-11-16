@@ -3,7 +3,7 @@
 // RUN: python3 %S/Inputs/check_l1_ordinary_fallback.py %t.bad.o nested_unproved_store_partition
 // CHECK: [program-split] reject: nested_unproved_store_partition
 // RUN: mkdir -p %t.ir
-// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=program-split-l1-materialize --save-temps=%t.ir -o %t.o 2>&1 | FileCheck %s --check-prefix=MATERIALIZE
+// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=l1-prefetch-materialize --save-temps=%t.ir -o %t.o 2>&1 | FileCheck %s --check-prefix=MATERIALIZE
 // RUN: python3 %S/Inputs/l1-contract/check.py %S/Inputs/l1-contract/two-input.json %t.o.program_split.json
 // RUN: FileCheck %s --check-prefix=FINAL < %t.ir/module.hivm.opt.mlir
 // MATERIALIZE: program_split.launch = {

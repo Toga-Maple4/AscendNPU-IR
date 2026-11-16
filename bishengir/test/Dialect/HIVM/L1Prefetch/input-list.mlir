@@ -1,11 +1,14 @@
 // Backend unit fixture: three selected input tiles with one common live rectangle.
 // This is not a benchmark preset. 3 x 42 KiB x 2 MB slots exceeds 248 KiB UB;
-// 3 x 42 KiB x 4 L1 banks fits 512 KiB, exercising the real retry.
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s --check-prefix=ANALYSIS
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s --check-prefix=TRANSFORM
+// 3 x 42 KiB x 4 L1 banks fits 512 KiB. The source continuation adds
+// arithmetic to this unit fixture to exercise retry above its profitability
+// threshold, without changing its access proof or any benchmark preset.
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s --check-prefix=ANALYSIS
+// RUN: bishengir-opt %s --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s --check-prefix=TRANSFORM
+// RUN: python3 %S/Inputs/profitability_fixture.py %s %t.eligible
 // RUN: mkdir -p %t.ir
 // The A5 driver owns the regbase pipeline; inspect its actual materialization and final IR.
-// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts --mlir-print-ir-after=program-split-l1-materialize,hivm-plan-memory-regbase --save-temps=%t.ir -o %t.external 2> %t.external.log
+// RUN: bishengir-compile %t.eligible --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts --mlir-print-ir-after=l1-prefetch-materialize,hivm-plan-memory-regbase --save-temps=%t.ir -o %t.external 2> %t.external.log
 // RUN: python3 -c "import pathlib; print(pathlib.Path('%t.external.log').read_text().split('// -----// IR Dump After PlanMemoryRegBase (hivm-plan-memory-regbase) //----- //')[-1])" | FileCheck %s --check-prefix=LOWER
 // RUN: FileCheck %s --check-prefix=MATERIALIZE < %t.external.log
 // RUN: FileCheck %s --check-prefix=CONTRACT < %t.external.program_split.json

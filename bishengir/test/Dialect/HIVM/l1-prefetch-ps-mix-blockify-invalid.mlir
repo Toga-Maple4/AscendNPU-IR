@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s -program-split-mix-blockify -verify-diagnostics -split-input-file -o /dev/null
+// RUN: bishengir-opt %s -l1-prefetch-map-programs -verify-diagnostics -split-input-file -o /dev/null
 
 module attributes {hivm.module_core_type = #hivm.module_core_type<AIV>} {
   // expected-error@+1 {{program-split lost selected input identity}}

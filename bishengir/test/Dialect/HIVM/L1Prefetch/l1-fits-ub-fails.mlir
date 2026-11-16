@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --hacc-append-device-spec=target=Ascend950PR_9589 --program-split-l1-materialize -o %t.materialized
+// RUN: bishengir-opt %s --hacc-append-device-spec=target=Ascend950PR_9589 --l1-prefetch-materialize -o %t.materialized
 // RUN: FileCheck %s --check-prefix=L1 < %t.materialized
 // RUN: not bishengir-opt %t.materialized --one-shot-bufferize='allow-unknown-ops=true bufferize-function-boundaries=true' --canonicalize --bind-buffer --hivm-infer-mem-scope --hivm-plan-memory -o %t.planned 2> %t.plan.log
 // RUN: FileCheck %s --check-prefix=UB < %t.plan.log

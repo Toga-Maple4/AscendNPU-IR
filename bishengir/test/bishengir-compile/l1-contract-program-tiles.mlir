@@ -1,0 +1,3 @@
+// Real workbook input: its original arithmetic and separate input strides are unchanged.
+// RUN: bishengir-compile %S/../Dialect/HIVM/L1Prefetch/program-tiles.mlir --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --enable-vf-fusion=true --enable-auto-bind-sub-block=true --limit-auto-multi-buffer-of-local-buffer=no-limit --enable-vf-merge-level=1 -o %t.o
+// RUN: python3 %S/Inputs/l1-contract/check.py %S/Inputs/l1-contract/program-tiles.json %t.o.program_split.json

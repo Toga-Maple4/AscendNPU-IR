@@ -1,5 +1,5 @@
 // Real direct GELU TTAdapter input, selected by backend semantic analysis.
-// RUN: bishengir-compile %s --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=program-split-mix-blockify --mlir-print-ir-after=program-split-l1-materialize --mlir-print-ir-after=hivm-plan-memory-regbase --mlir-print-ir-after=program-split-l1-finalize-sync --mlir-print-ir-after=hivm-graph-sync-solver -o %t.split.o > %t.ir 2>&1
+// RUN: bishengir-compile %s --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=l1-prefetch-map-programs --mlir-print-ir-after=l1-prefetch-materialize --mlir-print-ir-after=hivm-plan-memory-regbase --mlir-print-ir-after=l1-prefetch-balance-sync --mlir-print-ir-after=hivm-graph-sync-solver -o %t.split.o > %t.ir 2>&1
 // RUN: FileCheck %s --check-prefix=SCHEDULE < %t.ir
 // RUN: FileCheck %s --check-prefix=MATERIALIZE < %t.ir
 // RUN: FileCheck %s --check-prefix=MEMORY < %t.ir
@@ -19,7 +19,7 @@
 // SCHEDULE: %{{.*}} = arith.addi %{{.*}}, %[[OFFSET]] : i32
 // SCHEDULE: program_split.whole_program_vector
 // ORDINARY: "kind":"ordinary"
-// MATERIALIZE: IR Dump After ProgramSplitL1Materialize
+// MATERIALIZE: IR Dump After L1PrefetchMaterialize
 // MATERIALIZE: %[[S0_PING:.*]] = memref.alloc() : memref<16x2048xf32, #hivm.address_space<cbuf>>
 // MATERIALIZE: %[[S0_PONG:.*]] = memref.alloc() : memref<16x2048xf32, #hivm.address_space<cbuf>>
 // MATERIALIZE: %[[S1_PING:.*]] = memref.alloc() : memref<16x2048xf32, #hivm.address_space<cbuf>>
@@ -53,7 +53,7 @@
 // MATERIALIZE-NEXT: hivm.hir.l12ub ins(%[[S1_PONG]]{{.*}}sub_blockid = true
 // MATERIALIZE: hivm.hir.store{{.*}}hivm.sync_memory_read_ids = array<i32: 0>
 // MATERIALIZE-NOT: core_type = <VECTOR>
-// SYNC: IR Dump After ProgramSplitL1FinalizeSync
+// SYNC: IR Dump After L1PrefetchBalanceSync
 // SYNC-LABEL: func.func @_gelu_direct_56aiv_mix_aic
 // AIC owns the two-load prologue.
 // SYNC: hivm.hir.load

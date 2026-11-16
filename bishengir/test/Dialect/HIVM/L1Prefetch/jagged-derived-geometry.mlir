@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s
 // CHECK: element_bits = 16 : i32
 // CHECK-SAME: tile_cols = 128 : i32, tile_rows = 128 : i32
 // CHECK: hivm.hir.load

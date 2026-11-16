@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --program-split-l1-finalize-sync | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-balance-sync | FileCheck %s
 // Numeric flags can be reused. Finalization must preserve all dependencies,
 // including an unrelated V->MTE1 event sharing a flag with a guarded handoff.
 // CHECK-LABEL: func.func @cube

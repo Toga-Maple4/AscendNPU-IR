@@ -1,4 +1,4 @@
-//===- L1PrefetchPSFinalizeSync.cpp - Balance split L1 sync ------------===//
+//===- L1PrefetchBalanceSync.cpp - Balance split L1 sync ------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -16,7 +16,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace mlir {
-#define GEN_PASS_DEF_PROGRAMSPLITL1FINALIZESYNC
+#define GEN_PASS_DEF_L1PREFETCHBALANCESYNC
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 } // namespace mlir
 
@@ -59,8 +59,8 @@ bool isSyncOnly(scf::IfOp ifOp) {
           ifOp.getElseRegion().front().without_terminator().empty());
 }
 
-struct ProgramSplitL1FinalizeSyncPass
-    : impl::ProgramSplitL1FinalizeSyncBase<ProgramSplitL1FinalizeSyncPass> {
+struct L1PrefetchBalanceSyncPass
+    : impl::L1PrefetchBalanceSyncBase<L1PrefetchBalanceSyncPass> {
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     if (!func->hasAttr("program_split.transformed"))
@@ -155,6 +155,6 @@ struct ProgramSplitL1FinalizeSyncPass
 
 } // namespace
 
-std::unique_ptr<Pass> mlir::hivm::createProgramSplitL1FinalizeSyncPass() {
-  return std::make_unique<ProgramSplitL1FinalizeSyncPass>();
+std::unique_ptr<Pass> mlir::hivm::createL1PrefetchBalanceSyncPass() {
+  return std::make_unique<L1PrefetchBalanceSyncPass>();
 }

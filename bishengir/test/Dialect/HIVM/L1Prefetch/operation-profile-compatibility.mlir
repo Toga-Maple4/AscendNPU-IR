@@ -1,7 +1,7 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis | FileCheck %s
-// Preserve the previous ownership proofs' operation sets during consolidation.
-// Each rejected input differs from an accepted real input by one pure operation.
-// The rejection is compatibility policy, not a claim that the extra op is unsafe.
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze | FileCheck %s
+// Historical operation-profile restrictions are superseded by shared property
+// and effect checks. Each pair retains identical memory/control structure; an
+// additional pure operation is no longer a reason to reject the schedule.
 
 // CHECK-LABEL: func.func @persistent_exp
 // CHECK-SAME: l1_prefetch_ps.accepted
@@ -58,7 +58,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
 // -----
 
 // CHECK-LABEL: func.func @persistent_tanh
-// CHECK-SAME: l1_prefetch_ps.reject_reason = "unsupported_memory_or_control_flow"
+// CHECK-SAME: l1_prefetch_ps.accepted
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9589">} {
   func.func @persistent_tanh(%arg0: memref<?xi8>, %arg1: memref<?xi8>, %arg2: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg3: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32}, %arg4: i32, %arg5: i32, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32) attributes {SyncBlockLockArgIdx = 0 : i64, WorkspaceArgIdx = 1 : i64, global_kernel = "local", ascend.memory.pointer_args_noalias, mix_mode = "aiv", parallel_mode = "simd"} {
     %c8192 = arith.constant 8192 : index
@@ -190,7 +190,7 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 
 // CHECK-LABEL: func.func @jagged_tensor_empty
-// CHECK-SAME: l1_prefetch_ps.reject_reason = "jagged_unsupported_memory_or_control_flow"
+// CHECK-SAME: l1_prefetch_ps.accepted
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   func.func @jagged_tensor_empty(%arg0: memref<?xi8>, %arg1: memref<?xi8>, %arg2: memref<?xbf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg3: memref<?xi64> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: memref<?xbf16> {tt.divisibility = 16 : i32, tt.tensor_kind = 1 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32, %arg9: i32, %arg10: i32, %arg11: i32, %arg12: i32, %arg13: i32) attributes {ascend.memory.pointer_args_noalias, SyncBlockLockArgIdx = 0 : i64, WorkspaceArgIdx = 1 : i64, global_kernel = "local", mix_mode = "aiv", parallel_mode = "simd"} {
     %unused = tensor.empty() : tensor<1xf32>

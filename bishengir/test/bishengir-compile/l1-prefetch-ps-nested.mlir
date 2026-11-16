@@ -1,7 +1,7 @@
 // Real original-GELU forward TTAdapter dump, analyzed in AscendNPU-IR.
 // No kernel source, tensor formula, operation ordering or tile changes.
 // RUN: mkdir -p %t.ir
-// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=program-split-l1-materialize --save-temps=%t.ir -o %t.o 2>&1 | FileCheck %s --check-prefix=IR
+// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=l1-prefetch-materialize --save-temps=%t.ir -o %t.o 2>&1 | FileCheck %s --check-prefix=IR
 // RUN: python3 %S/Inputs/l1-contract/check.py %S/Inputs/l1-contract/nested.json %t.o.program_split.json
 // RUN: FileCheck %s --check-prefix=FINAL < %t.ir/module.hivm.opt.mlir
 // RUN: sed 's/0.000000e+00 : f16/1.000000e+00 : f16/' %s | bishengir-compile --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true -o %t.bad.o 2>&1 | FileCheck %s --check-prefix=BAD
@@ -26,7 +26,7 @@
 // FINAL-NOT: call @load_gm_to_
 // FINAL: hivm.hir.sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_MTE1>]
 // FINAL-NOT: call @load_gm_to_
-// IR: IR Dump After ProgramSplitL1Materialize
+// IR: IR Dump After L1PrefetchMaterialize
 // IR: program_split.transformed
 // IR: memref<32x2048xf16
 // IR: hivm.hir.l12ub

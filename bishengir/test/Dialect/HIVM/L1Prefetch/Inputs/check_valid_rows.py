@@ -9,7 +9,7 @@ source = Path(fixture).read_text()
 
 
 def run(text, expected_copies=4):
-    result = subprocess.run([opt, '--program-split-l1-materialize', '--canonicalize',
+    result = subprocess.run([opt, '--l1-prefetch-materialize', '--canonicalize',
                              '--mlir-print-unique-ssa-ids'],
                             input=text, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr

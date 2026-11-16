@@ -125,14 +125,14 @@ add_bishengir_dialect_library(BiShengIRHIVMTransforms
   OptMemPlanForPipeline.cpp
   OutlineAllocInVF.cpp
   OutlineCopyInVF.cpp
-  L1PrefetchPSAnalysis.cpp
+  L1PrefetchAnalyze.cpp
   L1PrefetchPSNestedAnalysis.cpp
   L1PrefetchPSJaggedAnalysis.cpp
-  L1PrefetchPSTransform.cpp
-  L1PrefetchPSMixBlockify.cpp
-  L1PrefetchPSMaterialize.cpp
-  L1PrefetchPSFinalizeSync.cpp
-  L1PrefetchPSConsumerSync.cpp
+  L1PrefetchNormalize.cpp
+  L1PrefetchMapPrograms.cpp
+  L1PrefetchMaterialize.cpp
+  L1PrefetchBalanceSync.cpp
+  L1PrefetchConsumerHandoff.cpp
   LowerUBPlanRelease.cpp
   PlanMemory.cpp
   regbase/PlanMemory.cpp

@@ -1,4 +1,4 @@
-//===- L1PrefetchPSMixBlockify.cpp - Whole-program MIX distribution ------===//
+//===- L1PrefetchMapPrograms.cpp - Whole-program MIX distribution ------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "L1PrefetchPSDependencies.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -21,9 +22,10 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include <functional>
 
 namespace mlir {
-#define GEN_PASS_DEF_PROGRAMSPLITMIXBLOCKIFY
+#define GEN_PASS_DEF_L1PREFETCHMAPPROGRAMS
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 } // namespace mlir
 
@@ -43,6 +45,89 @@ void collectDependencies(Value value, llvm::SmallPtrSetImpl<Operation *> &keep) 
     collectDependencies(operand, keep);
 }
 
+// The launcher proves each recorded grid dimension positive and their product
+// <= INT32_MAX. Only products within the actual logical-grid expression inherit
+// this fact, with each axis used once. This is not inference from a generic
+// positive product, nor from the positions of physical function arguments.
+SmallVector<Value> positiveGridDivisors(func::FuncOp func, Value logicalGrid) {
+  SmallVector<Value> axes(3), positive;
+  for (BlockArgument arg : func.getArguments()) {
+    auto axis = func.getArgAttrOfType<IntegerAttr>(
+        arg.getArgNumber(), l1prefetch::kLaunchGridAxis);
+    if (!axis)
+      continue;
+    if (axis.getInt() < 0 || axis.getInt() >= 3 ||
+        axes[axis.getInt()] || !arg.getType().isInteger(32))
+      return {};
+    axes[axis.getInt()] = arg;
+  }
+  if (llvm::any_of(axes, [](Value value) { return !value; }))
+    return {};
+  std::function<unsigned(Value)> collect = [&](Value value) -> unsigned {
+    auto found = llvm::find(axes, value);
+    if (found != axes.end()) {
+      positive.push_back(value);
+      return 1u << (found - axes.begin());
+    }
+    auto mul = value.getDefiningOp<arith::MulIOp>();
+    if (!mul || !value.getType().isInteger(32))
+      return 0;
+    unsigned lhs = collect(mul.getLhs()), rhs = collect(mul.getRhs());
+    if (!lhs || !rhs || (lhs & rhs))
+      return 0;
+    positive.push_back(value);
+    return lhs | rhs;
+  };
+  if (collect(logicalGrid) != 7)
+    return {};
+  return positive;
+}
+
+// A remapped valid ID is another original program. An odd grid additionally
+// has an inactive peer: do not evaluate unsafe raw-ID-dependent operations for
+// that peer. Keep safe ID de-linearization in place and sink the remaining
+// slice under the existing payload predicate, without guarding synchronization.
+// Normalization puts the entire payload in work; only its preceding dependency
+// slice is scanned here, not arbitrary operations after the guard.
+LogicalResult guardInactivePeer(scf::ForOp loop, scf::IfOp work, Value logical,
+                                ArrayRef<Value> positiveDivisors) {
+  llvm::SmallPtrSet<Operation *, 32> dependent, guarded;
+  SmallVector<Operation *> ordered;
+  dependent.insert(logical.getDefiningOp());
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (&op == work.getOperation())
+      break;
+    if (&op == logical.getDefiningOp() ||
+        !llvm::any_of(op.getOperands(), [&](Value value) {
+          return dependent.contains(value.getDefiningOp());
+        }))
+      continue;
+    dependent.insert(&op);
+    bool safe = l1prefetch::isSpeculatableDependency(&op) ||
+        (isa<arith::DivSIOp, arith::RemSIOp>(op) &&
+         llvm::is_contained(positiveDivisors, op.getOperand(1)));
+    if (safe && !llvm::any_of(op.getOperands(), [&](Value value) {
+          return guarded.contains(value.getDefiningOp());
+        }))
+      continue;
+    guarded.insert(&op);
+    ordered.push_back(&op);
+  }
+  // Accepted Flat predicates use only grid de-linearization and linear bounds;
+  // Program predicates use the raw valid-ID check. Neither needs the unsafe
+  // payload slice to decide participation. Verify that invariant before moving;
+  // work itself (a condition use) is an escape, not a use inside its payload.
+  for (Operation *op : ordered)
+    for (Operation *user : op->getUsers())
+      if (!guarded.contains(user) && !work->isProperAncestor(user))
+        return loop.emitError("L1 pipeline error: unsafe resident dependency "
+                              "escapes the valid-program payload");
+  Operation *first = &work.getThenRegion().front().front();
+  for (Operation *op : ordered)
+    op->moveBefore(first);
+  return success();
+}
+
 // Present one continuous tile stream to the common L1 materializer. Without a
 // resident-pair extent, each trio owns one logical pair; leave that IR unchanged.
 // When a trio owns several pairs, concatenate their normalized tile
@@ -50,6 +135,8 @@ void collectDependencies(Value value, llvm::SmallPtrSetImpl<Operation *> &keep) 
 LogicalResult normalizeResidentTileStream(scope::ScopeOp scope, Value selected,
                                          Value logicalBase, Value physicalId,
                                          Value halfGrid, Value logicalGrid, IntegerAttr pairStride,
+                                         bool wholeProgram,
+                                         ArrayRef<Value> positiveDivisors,
                                          IRRewriter &rewriter) {
   if (!pairStride)
     return success();
@@ -92,18 +179,25 @@ LogicalResult normalizeResidentTileStream(scope::ScopeOp scope, Value selected,
   llvm::SmallPtrSet<Operation *, 32> dependent;
   SmallVector<Operation *> ordered;
   dependent.insert(logicalBase.getDefiningOp());
+  auto dependencies = l1prefetch::stagingDependencies(
+      scope->getParentOfType<func::FuncOp>(), scope,
+      ValueRange{logicalBase}, loop, {&scope.getRegion().front()},
+      /*addressOnly=*/false);
   for (Operation &op : scope.getRegion().front()) {
     if (&op == loop.getOperation())
       break;
     if (&op == logicalBase.getDefiningOp() ||
         !llvm::any_of(op.getOperands(), [&](Value value) {
           return dependent.contains(value.getDefiningOp());
-        }))
+        })) {
+      for (Value result : op.getResults())
+        dependencies.reuseDominating(result);
       continue;
-    if (op.getNumRegions() || op.getNumSuccessors() ||
-        (!isMemoryEffectFree(&op) &&
-         !(isa<memref::LoadOp>(op) && op.hasAttr("program_split.metadata"))))
-      return scope.emitError("program-split cannot relocate resident address slice");
+    }
+    // Valid resident IDs reproduce original executions. guardInactivePeer
+    // below additionally protects unsafe arithmetic from the odd-grid peer.
+    if (!dependencies.checkOperation(&op))
+      return scope.emitError("L1 pipeline error: resident dependency proof was lost");
     dependent.insert(&op);
     ordered.push_back(&op);
   }
@@ -123,7 +217,12 @@ LogicalResult normalizeResidentTileStream(scope::ScopeOp scope, Value selected,
   Value rounded = rewriter.create<arith::AddIOp>(loc, remaining, padding);
   Value pairs = rewriter.create<arith::DivSIOp>(loc, rounded, stride);
   Value steps = rewriter.create<arith::MulIOp>(loc, pairs, tilesPerPair);
+  bool nonempty = l1prefetch::isNonemptyTileStream(loop);
   loop.setUpperBound(steps);
+  // physical_block_count launches min(halfGrid, pairStride) groups. Therefore
+  // every launched group owns at least one pair; concatenation preserves entry.
+  if (nonempty)
+    loop->setAttr(l1prefetch::kNonemptyTileStream, rewriter.getUnitAttr());
 
   Operation *first = &loop.getBody()->front();
   rewriter.setInsertionPoint(first);
@@ -152,14 +251,21 @@ LogicalResult normalizeResidentTileStream(scope::ScopeOp scope, Value selected,
   rewriter.setInsertionPoint(work);
   Value wideGrid = rewriter.create<arith::ExtSIOp>(loc, logical.getType(), logicalGrid);
   Value inGrid = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, logical, wideGrid);
-  Value active = rewriter.create<arith::AndIOp>(loc, inGrid, work.getCondition());
+  // Whole-program normalization creates only XYZ grid checks here. A valid
+  // raw ID implies all three after de-linearization: launch validation proves
+  // positive dimensions and bounds the grid product/resident lookahead. Replace
+  // those checks only once this stronger, pre-remainder predicate is available.
+  // Flat streams also guard their data extent, which must remain independent.
+  Value active = inGrid;
+  if (!wholeProgram)
+    active = rewriter.create<arith::AndIOp>(loc, inGrid, work.getCondition());
   work.getConditionMutable().assign(active);
-  return success();
+  return guardInactivePeer(loop, work, logical, positiveDivisors);
 }
 
-struct ProgramSplitMixBlockifyPass
-    : impl::ProgramSplitMixBlockifyBase<ProgramSplitMixBlockifyPass> {
-  using ProgramSplitMixBlockifyBase::ProgramSplitMixBlockifyBase;
+struct L1PrefetchMapProgramsPass
+    : impl::L1PrefetchMapProgramsBase<L1PrefetchMapProgramsPass> {
+  using L1PrefetchMapProgramsBase::L1PrefetchMapProgramsBase;
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
@@ -179,9 +285,29 @@ struct ProgramSplitMixBlockifyPass
                         fixedPhysical.getInt() != fixedLogical.getInt() / 2)
                      : (!launch.getAs<IntegerAttr>("rows_arg") &&
                         !launch.getAs<IntegerAttr>("static_rows") &&
-                        !launch.getAs<IntegerAttr>("jagged_copy") && !launch.contains("flat_tile"))) {
+                        !launch.getAs<IntegerAttr>("jagged_copy") &&
+                        !launch.contains("flat_tile") && !launch.contains("program_tile") &&
+                        !launch.contains("persistent_runtime"))) {
       func.emitError("L1 pipeline error: inconsistent transformed launch metadata");
       return signalPassFailure();
+    }
+    if (launch.contains("persistent_runtime")) {
+      auto mode = launch.getAs<IntegerAttr>("persistent_runtime");
+      bool valid = mode && mode.getInt() == 1 && !fixedLogical &&
+                   !launch.contains("pair_stride");
+      for (StringRef name : {"logical_programs", "persistent_steps", "row_tasks"}) {
+        auto arg = launch.getAs<IntegerAttr>((name + "_arg").str());
+        auto literal = launch.getAs<IntegerAttr>(("static_" + name).str());
+        auto grid = launch.getAs<IntegerAttr>((name + "_grid").str());
+        valid &= bool(arg) + bool(literal) + bool(grid) == 1;
+        valid &= !arg || arg.getInt() >= 2;
+        valid &= !literal || literal.getInt() > 0;
+        valid &= !grid || (grid.getInt() >= 0 && grid.getInt() < 3);
+      }
+      if (!valid) {
+        func.emitError("L1 pipeline error: malformed runtime Persistent counts");
+        return signalPassFailure();
+      }
     }
     if (failed(verifyL1PrefetchPSRealizationRoles(func, launch)))
       return signalPassFailure();
@@ -245,6 +371,10 @@ struct ProgramSplitMixBlockifyPass
       return signalPassFailure();
     }
 
+    auto positiveDivisors = positiveGridDivisors(func, logicalMark.getSrc());
+    for (BlockArgument arg : func.getArguments())
+      func.removeArgAttr(arg.getArgNumber(), l1prefetch::kLaunchGridAxis);
+
     llvm::SmallPtrSet<Operation *, 8> keep;
     collectDependencies(logicalMark.getSrc(), keep);
     keep.insert(logicalMark);
@@ -268,7 +398,7 @@ struct ProgramSplitMixBlockifyPass
     } else {
       Value two = rewriter.create<arith::ConstantIntOp>(loc, 2, 32);
       Value logicalCount = logicalMark.getSrc();
-      if (launch.contains("flat_tile")) {
+      if (launch.contains("flat_tile") || launch.contains("program_tile")) {
         Value one = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
         logicalCount = rewriter.create<arith::AddIOp>(loc, logicalCount, one);
       }
@@ -319,13 +449,13 @@ struct ProgramSplitMixBlockifyPass
     rewriter.create<scope::ReturnOp>(loc);
     if (failed(normalizeResidentTileStream(vectorScope, selectedInput[0],
                                           logicalId, physicalId, halfGrid,
-                                          launch.contains("flat_tile") ? logicalMark.getSrc() : Value{},
-                                          pairStride, rewriter)))
+                                          (launch.contains("flat_tile") || launch.contains("program_tile")) ? logicalMark.getSrc() : Value{},
+                                          pairStride, launch.contains("program_tile"), positiveDivisors, rewriter)))
       return signalPassFailure();
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> mlir::hivm::createProgramSplitMixBlockifyPass() {
-  return std::make_unique<ProgramSplitMixBlockifyPass>();
+std::unique_ptr<Pass> mlir::hivm::createL1PrefetchMapProgramsPass() {
+  return std::make_unique<L1PrefetchMapProgramsPass>();
 }

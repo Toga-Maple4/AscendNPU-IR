@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze | FileCheck %s
 
 // Layout variations use access-derived roles; pointer overlap still rejects.
 // CHECK-LABEL: func.func @reordered_pointers

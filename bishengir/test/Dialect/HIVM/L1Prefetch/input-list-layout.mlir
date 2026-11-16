@@ -1,7 +1,12 @@
 // The same N=3 access proof with reordered pointers, constant rows, a shared
 // columns/stride argument, and unused scalar/pointer arguments. Unit fixture.
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis --l1-prefetch-ps-transform | FileCheck %s --check-prefix=IR
-// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts -o %t.external 2> %t.external.log
+// RUN: bishengir-opt %s --l1-prefetch-analyze --l1-prefetch-normalize | FileCheck %s --check-prefix=IR
+// RUN: bishengir-compile %s --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts -o %t.filtered.o 2> %t.external.log
+// RUN: FileCheck %s --check-prefix=FILTER < %t.external.log
+// RUN: python3 %S/../../../bishengir-compile/Inputs/check_l1_ordinary_fallback.py %t.filtered.o ordinary_compiled
+// FILTER: [program-split] filtered: compute_score_below_40
+// RUN: python3 %S/Inputs/profitability_fixture.py %s %t.eligible
+// RUN: bishengir-compile %t.eligible --target=Ascend950PR_9589 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --disable-ffts -o %t.external 2> %t.external.log
 // RUN: FileCheck %s --check-prefix=CONTRACT < %t.external.program_split.json
 // IR: input_args = array<i32: 3, 4, 5>
 // IR-SAME: output_arg = 2 : i32

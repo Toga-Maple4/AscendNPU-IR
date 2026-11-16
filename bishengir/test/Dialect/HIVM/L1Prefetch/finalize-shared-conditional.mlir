@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s -program-split-l1-finalize-sync | FileCheck %s
+// RUN: bishengir-opt %s -l1-prefetch-balance-sync | FileCheck %s
 // Captured from l1-prefetch-ps-retry.mlir with shared UB conditional intact.
 // Both cores must participate in the existing handshake on inactive work.
 // CHECK-LABEL: func.func @_gelu_direct_56aiv_mix_aic(

@@ -1,7 +1,7 @@
 //===- L1PrefetchPSJaggedAnalysis.cpp - Jagged copy proof ----------------===//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-#include "L1PrefetchPSRoles.h"
+#include "L1PrefetchPSFacts.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/Transforms/L1PrefetchPS.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -80,7 +80,7 @@ std::string mlir::hivm::analyzeJaggedTileCandidate(func::FuncOp func,
   auto &stores = inventory.stores;
   auto &slices = inventory.slices;
   auto &fills = inventory.fills;
-  bool unsupported = !inventory.supports(OperationProfile::Jagged);
+  bool unsupported = inventory.hasUnsupportedOperation();
   if (unsupported || loops.size() != 2 || ifs.size() != 1 ||
       metadataLoads.size() != 2 || copies.size() != 1 || allocs.size() != 1 ||
       tensors.size() != 1 || stores.size() != 1 || slices.size() != 1 ||
@@ -230,7 +230,11 @@ std::string mlir::hivm::analyzeJaggedTileCandidate(func::FuncOp func,
   // effects.
   if (!src->hasOneUse() || !dst->hasOneUse() || !out->hasOneUse())
     return "jagged_unproved_copy_rectangle";
+  if (!hasStagingEffects(func, inventory, ifs, metadataLoads))
+    return "unmodelled_memory_dependency";
   OpBuilder b(func.getContext());
+  if (failed(publishAcceptedFacts(func, {AccessSchedule::Jagged, roles, {}, {}, {}})))
+    return "inconsistent_accepted_facts";
   func->setAttr("l1_prefetch_ps.jagged", b.getUnitAttr());
   bound->setAttr("l1_prefetch_ps.rows", b.getUnitAttr());
   outer->setAttr("l1_prefetch_ps.outer", b.getUnitAttr());

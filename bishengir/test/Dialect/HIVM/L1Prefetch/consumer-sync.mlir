@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --program-split-l1-consumer-sync | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-consumer-handoff | FileCheck %s
 // RUN: python3 %S/Inputs/check_consumer_sync.py bishengir-opt %s
 //
 // The first consumer must receive both readiness events before the second

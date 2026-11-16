@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze | FileCheck %s
 // Literal negative ownership fixtures; no partial selections on rejection.
 
 // CHECK-LABEL: func.func @different_live_rectangle

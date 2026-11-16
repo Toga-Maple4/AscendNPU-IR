@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-analyze | FileCheck %s
 // A folded task count must still equal ceil(rows / tile_rows).
 // CHECK-LABEL: func.func @inconsistent_constant_rows
 // CHECK-SAME: l1_prefetch_ps.reject_reason = "nested_unproved_shape_bounds"

@@ -1415,35 +1415,35 @@ def CVPipelining : Pass<"cv-pipelining", "func::FuncOp"> {
                         "Enable registered-kernel CV-pipelining heuristics">];
 }
 
-def L1PrefetchPSAnalysis : Pass<"l1-prefetch-ps-analysis", "ModuleOp"> {
+def L1PrefetchAnalyze : Pass<"l1-prefetch-analyze", "ModuleOp"> {
   let summary = "Prove program-split eligibility without changing executable IR";
   let description = [{Prove alias, ownership, bounds and selected-input relationships.
     Attach clone-stable proof markers; physical capacity is decided by PlanMemory.}];
-  let constructor = "mlir::hivm::createL1PrefetchPSAnalysisPass()";
+  let constructor = "mlir::hivm::createL1PrefetchAnalyzePass()";
   let dependentDialects = ["annotation::AnnotationDialect"];
 }
 
-def L1PrefetchPSTransform : Pass<"l1-prefetch-ps-transform", "ModuleOp"> {
+def L1PrefetchNormalize : Pass<"l1-prefetch-normalize", "ModuleOp"> {
   let summary = "Consume accepted structured-IR analysis on the pristine retry clone";
   let description = [{Consume verified selection markers on a pristine retry clone
     and normalize supported ownership patterns to the shared tile stream.}];
-  let constructor = "mlir::hivm::createL1PrefetchPSTransformPass()";
+  let constructor = "mlir::hivm::createL1PrefetchNormalizePass()";
   let dependentDialects = ["hivm::HIVMDialect", "arith::ArithDialect",
     "scf::SCFDialect", "memref::MemRefDialect", "tensor::TensorDialect",
     "bufferization::BufferizationDialect", "annotation::AnnotationDialect"];
 }
 
-def ProgramSplitMixBlockify
-    : Pass<"program-split-mix-blockify", "func::FuncOp"> {
+def L1PrefetchMapPrograms
+    : Pass<"l1-prefetch-map-programs", "func::FuncOp"> {
   let summary = "Assign one complete logical program to each MIX vector subcore";
-  let constructor = "mlir::hivm::createProgramSplitMixBlockifyPass()";
+  let constructor = "mlir::hivm::createL1PrefetchMapProgramsPass()";
   let dependentDialects = [
     "hivm::HIVMDialect", "scope::ScopeDialect", "arith::ArithDialect"
   ];
 }
 
-def ProgramSplitL1Materialize
-    : Pass<"program-split-l1-materialize", "func::FuncOp"> {
+def L1PrefetchMaterialize
+    : Pass<"l1-prefetch-materialize", "func::FuncOp"> {
   let summary = "Materialize the accepted program-split GM to L1 to UB path";
   let description = [{
     Stage the accepted selected input for logical workers b and b+N/2 through
@@ -1451,7 +1451,7 @@ def ProgramSplitL1Materialize
     consumption preserve whole-program ownership. Existing physical planning
     and synchronization passes complete the lowered schedule.
   }];
-  let constructor = "mlir::hivm::createProgramSplitL1MaterializePass()";
+  let constructor = "mlir::hivm::createL1PrefetchMaterializePass()";
   let dependentDialects = [
     "hivm::HIVMDialect", "scope::ScopeDialect", "arith::ArithDialect",
     "scf::SCFDialect", "memref::MemRefDialect",
@@ -1459,8 +1459,8 @@ def ProgramSplitL1Materialize
   ];
 }
 
-def ProgramSplitL1FinalizeSync
-    : Pass<"program-split-l1-finalize-sync", "func::FuncOp"> {
+def L1PrefetchBalanceSync
+    : Pass<"l1-prefetch-balance-sync", "func::FuncOp"> {
   let summary = "Place program-split sync outside divergent vector guards";
   let description = [{
     After MIX splitting, move the GraphSyncSolver operations that protect the
@@ -1468,12 +1468,12 @@ def ProgramSplitL1FinalizeSync
     then execute identical wait/set counts even when only one logical worker
     owns a tail tile. Event allocation remains owned by GraphSyncSolver.
   }];
-  let constructor = "mlir::hivm::createProgramSplitL1FinalizeSyncPass()";
+  let constructor = "mlir::hivm::createL1PrefetchBalanceSyncPass()";
   let dependentDialects = ["hivm::HIVMDialect", "scf::SCFDialect"];
 }
 
-def ProgramSplitL1ConsumerSync
-    : Pass<"program-split-l1-consumer-sync", "func::FuncOp"> {
+def L1PrefetchConsumerHandoff
+    : Pass<"l1-prefetch-consumer-handoff", "func::FuncOp"> {
   let summary = "Publish each program-split UB delivery after its own release";
   let description = [{
     After memory planning and intra-core synchronization, refine the allocated
@@ -1481,7 +1481,7 @@ def ProgramSplitL1ConsumerSync
     consumer's L1-to-UB deliveries. Preserve event IDs, bank protection, and
     inactive-participant counts. VECTOR code and memory layout are unchanged.
   }];
-  let constructor = "mlir::hivm::createProgramSplitL1ConsumerSyncPass()";
+  let constructor = "mlir::hivm::createL1PrefetchConsumerHandoffPass()";
   let dependentDialects = ["hivm::HIVMDialect", "scf::SCFDialect"];
 }
 

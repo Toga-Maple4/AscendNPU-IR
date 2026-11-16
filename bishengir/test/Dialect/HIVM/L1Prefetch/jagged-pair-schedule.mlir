@@ -1,6 +1,6 @@
-// RUN: bishengir-opt %s --program-split-mix-blockify | FileCheck %s --check-prefix=STREAM
-// RUN: bishengir-opt %s --program-split-mix-blockify --program-split-l1-materialize | FileCheck %s --check-prefix=PIPELINE
-// RUN: bishengir-opt %s --program-split-mix-blockify --program-split-l1-materialize | FileCheck %s --check-prefix=ROWS
+// RUN: bishengir-opt %s --l1-prefetch-map-programs | FileCheck %s --check-prefix=STREAM
+// RUN: bishengir-opt %s --l1-prefetch-map-programs --l1-prefetch-materialize | FileCheck %s --check-prefix=PIPELINE
+// RUN: bishengir-opt %s --l1-prefetch-map-programs --l1-prefetch-materialize | FileCheck %s --check-prefix=ROWS
 // ROWS-LABEL: func.func @triton_jagged_to_dense
 // ROWS-COUNT-8: memref.subview {{.*}}[0, 0] [{{.*}}, 256] [1, 1] {{.*}} to memref<?x256xbf16, strided<[256, 1]>, #hivm.address_space<{{cbuf|ub}}>>
 // Real original 1D jagged IR immediately before MIX blockification.

@@ -1,5 +1,5 @@
-// RUN: bishengir-opt %s -program-split-mix-blockify | FileCheck %s
-// RUN: bishengir-opt %s -program-split-mix-blockify -hivm-split-mix-kernel | FileCheck %s --check-prefix=SPLIT
+// RUN: bishengir-opt %s -l1-prefetch-map-programs | FileCheck %s
+// RUN: bishengir-opt %s -l1-prefetch-map-programs -hivm-split-mix-kernel | FileCheck %s --check-prefix=SPLIT
 
 module attributes {hivm.module_core_type = #hivm.module_core_type<MIX>} {
   func.func @two_logical_programs(%grid_x: i32, %grid_y: i32, %grid_z: i32,

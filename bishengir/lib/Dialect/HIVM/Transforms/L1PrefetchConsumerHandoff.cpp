@@ -1,4 +1,4 @@
-//===- L1PrefetchPSConsumerSync.cpp - Refine paired UB handoff --------------===//
+//===- L1PrefetchConsumerHandoff.cpp - Refine paired UB handoff --------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -15,7 +15,7 @@
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 
 namespace mlir {
-#define GEN_PASS_DEF_PROGRAMSPLITL1CONSUMERSYNC
+#define GEN_PASS_DEF_L1PREFETCHCONSUMERHANDOFF
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 } // namespace mlir
 
@@ -195,8 +195,8 @@ void refineHandoff(Handoff &handoff) {
     signal.erase();
 }
 
-struct ProgramSplitL1ConsumerSyncPass
-    : impl::ProgramSplitL1ConsumerSyncBase<ProgramSplitL1ConsumerSyncPass> {
+struct L1PrefetchConsumerHandoffPass
+    : impl::L1PrefetchConsumerHandoffBase<L1PrefetchConsumerHandoffPass> {
   void runOnOperation() override {
     auto func = getOperation();
     if (!func->hasAttr("program_split.transformed") ||
@@ -224,6 +224,6 @@ struct ProgramSplitL1ConsumerSyncPass
 };
 } // namespace
 
-std::unique_ptr<Pass> mlir::hivm::createProgramSplitL1ConsumerSyncPass() {
-  return std::make_unique<ProgramSplitL1ConsumerSyncPass>();
+std::unique_ptr<Pass> mlir::hivm::createL1PrefetchConsumerHandoffPass() {
+  return std::make_unique<L1PrefetchConsumerHandoffPass>();
 }

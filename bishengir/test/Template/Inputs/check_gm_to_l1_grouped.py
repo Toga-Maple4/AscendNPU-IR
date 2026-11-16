@@ -42,13 +42,16 @@ template<int N> bool is_no_op(const int64_t *sizes) {
 template<class T> bool isAddress32ByteAligned(T *p) {
   return reinterpret_cast<uintptr_t>(p) % 32 == 0;
 }
-struct Copy { int count, len; };
+struct Copy { int count, len; uintptr_t src, dst; };
 static std::vector<Copy> copies;
 template<class T> void copy_gm_to_cbuf_align_v2(T *dst, T *src, int,
     uint16_t count, uint32_t len, int lp, int rp, bool, int,
     uint64_t src_stride, uint32_t dst_stride) {
   assert(lp == 0 && rp == 0);
-  copies.push_back({count, static_cast<int>(len)});
+  assert(count > 0 && count <= INTRIN_MAX_BURST_CNT);
+  copies.push_back({count, static_cast<int>(len),
+                    reinterpret_cast<uintptr_t>(src),
+                    reinterpret_cast<uintptr_t>(dst)});
   for (int i=0; i<count; ++i)
     std::memcpy(reinterpret_cast<char*>(dst) + i*dst_stride,
                 reinterpret_cast<char*>(src) + i*src_stride, len);
@@ -81,10 +84,19 @@ template<class T> void check(int64_t rows, int64_t cols, int64_t src_stride,
   copies.clear();
   load_gm_to_cbuf_2d_program_split_core(&s,&d,pad);
   assert(copies.size()==counts.size());
+  int64_t copied_rows = 0;
   for (size_t i=0;i<counts.size();++i) {
     assert(copies[i].count==counts[i]);
     assert(copies[i].len==cols*sizeof(T));
+    assert(copies[i].src == reinterpret_cast<uintptr_t>(src + offset + copied_rows*src_stride));
+    assert(copies[i].dst == reinterpret_cast<uintptr_t>(dst + offset + copied_rows*dst_stride));
+    // The grouped path requires aligned L1 bases, including every later chunk.
+    // GM bases are byte-aligned by the intrinsic contract, not necessarily 32B.
+    if ((offset*sizeof(T)) % 32 == 0 && (dst_stride*sizeof(T)) % 32 == 0)
+      assert(copies[i].dst % 32 == 0);
+    copied_rows += copies[i].count;
   }
+  assert(copied_rows == rows);
   for (int64_t row=0;row<rows;++row) {
     for (int64_t col=0;col<cols;++col)
       assert(dst[offset+row*dst_stride+col]==src[offset+row*src_stride+col]);
@@ -100,7 +112,13 @@ int main() {
   check<float>(3,16,48,24,8,{3}); // nonzero offset and gaps in both spaces
   check<float>(4096,8,16,8,0,{4095,1}); // burst-count chunk plus tail
   check<float>(2,5,8,8,0,{1,1}); // unaligned row length
-  check<float>(2,8,13,8,0,{1,1}); // unaligned GM row pitch
+  check<float>(2,8,13,8,0,{2}); // GM row pitch is byte-granular
+  check<float>(16,2048,8195,2048,0,{16}); // recovered partial FP32, full-width tile
+  check<float>(16,2048,16387,2048,0,{16}); // original partial FP32, full-width tile
+  check<uint16_t>(16,4096,8195,4096,0,{16}); // partial 16-bit storage
+  check<float>(4096,8,13,8,0,{4095,1}); // unaligned pitch across a burst chunk
+  assert(copies[0].src % 32 == 0 && copies[1].src % 32 == 12);
+  check<float>(2,3,8195,2048,0,{1,1}); // partial columns retain row fallback
   check<float>(2,8,16,8,1,{1,1}); // unaligned base address
   check<float>(2,8,(1<<19)+8,8,0,{2}); // source stride exceeds 21 bits
   check<float>(2,8,8,1<<19,0,{1,1}); // destination stride exceeds 21 bits

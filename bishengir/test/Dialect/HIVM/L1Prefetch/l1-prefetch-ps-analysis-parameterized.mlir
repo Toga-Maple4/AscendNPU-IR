@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-analyze | FileCheck %s
 //
 // CHECK-LABEL: func.func @small_grid
 // CHECK-SAME: l1_prefetch_ps.accepted

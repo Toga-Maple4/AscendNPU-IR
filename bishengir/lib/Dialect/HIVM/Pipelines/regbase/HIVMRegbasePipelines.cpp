@@ -410,8 +410,8 @@ static void hivmPreBufferizationOptimizationPipeline(
   // num. of physical blocks we loop on is dependent on core type
   if (hivmPipelineOptions.enableTritonKernelCompile &&
       hivmPipelineOptions.enableProgramSplitMix) {
-    pm.addPass(createProgramSplitMixBlockifyPass());
-    pm.addPass(createProgramSplitL1MaterializePass());
+    pm.addPass(createL1PrefetchMapProgramsPass());
+    pm.addPass(createL1PrefetchMaterializePass());
   } else if (hivmPipelineOptions.enableTritonKernelCompile &&
              hivmPipelineOptions.enableAutoBlockifyLoop) {
     pm.addPass(createAutoBlockifyParallelLoopPass());
@@ -514,7 +514,7 @@ static void hivmPreBufferizationOptimizationPipeline(
     pm.nest<func::FuncOp>().addPass(createSplitMixedIfConditionalsPass());
   pm.addPass(createSplitMixKernelPass());
   if (hivmPipelineOptions.enableProgramSplitMix)
-    pm.nest<func::FuncOp>().addPass(createProgramSplitL1FinalizeSyncPass());
+    pm.nest<func::FuncOp>().addPass(createL1PrefetchBalanceSyncPass());
   if (enableRegisteredPreloadHeuristics(hivmPipelineOptions)) {
     MergeSamePreloadScopesOptions mergeOpts;
     mergeOpts.enablePreload = true;
@@ -722,7 +722,7 @@ static void hivmPostBufferizationOptimizationPipeline(
   // Intra-Core Auto-Sync passes (Inject-Sync, GSS)
   hivmIntraCoreSyncPipeline(pm, hivmPipelineOptions);
   if (hivmPipelineOptions.enableProgramSplitMix)
-    pm.nest<func::FuncOp>().addPass(createProgramSplitL1ConsumerSyncPass());
+    pm.nest<func::FuncOp>().addPass(createL1PrefetchConsumerHandoffPass());
   pm.addPass(mlir::createMemrefExtLoweringPass());
   pm.nest<func::FuncOp>().addPass(createEnableMultiBufferPass());
   pm.nest<func::FuncOp>().addPass(createLowerMultiBufferCounterPass());

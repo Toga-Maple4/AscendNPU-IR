@@ -17,11 +17,18 @@ def run(source, *passes, succeeds=True):
     assert (p.returncode == 0) == succeeds, p.stderr
     return p.stdout if succeeds else p.stderr
 
-analysis = '--l1-prefetch-ps-analysis'
-transform = '--l1-prefetch-ps-transform'
+analysis = '--l1-prefetch-analyze'
+transform = '--l1-prefetch-normalize'
 a = run(mapped, analysis)
 assert a.count('l1_prefetch_ps.accepted') == 1 and 'reject_reason' not in a
 assert 'attributes {llvm.readnone}' in a  # declaration receives no kernel proof
+profit = subprocess.run([opt, analysis], input=mapped, text=True, capture_output=True)
+assert profit.returncode == 0
+assert profit.stderr.count('[program-split-profitability]') == 1
+assert 'unknown_operation_cost' in profit.stderr
+assert '"compute_score":null' in profit.stderr.replace(' ', '')
+assert 'l1_prefetch_ps.facts' in a
+print('PASS mapped tanh profitability remains unknown; only kernel is reported')
 assert run(a, analysis) == a
 transformed = run(a, transform)
 assert 'program_split.transformed' in transformed
@@ -73,6 +80,11 @@ for name, text in {
 
 
 for name, text in {
+    'changed_declaration_mapping_attributes': a.replace(
+        'attributes {llvm.readnone}',
+        'attributes {llvm.readnone, integration.mapping_context = "changed"}'),
+    'changed_accepted_facts': a.replace('l1_prefetch_ps.facts = {',
+        'l1_prefetch_ps.facts = {unexpected = 1 : i32, ', 1),
     'changed_declaration_purity': a.replace('attributes {llvm.readnone}', ''),
     'changed_callee': a.replace('__hmf_tanhf', '__hmf_unknown'),
     'changed_declaration_body': a.replace(decl, 'func.func private @__hmf_tanhf(%x: f32) -> f32 { return %x : f32 }'),

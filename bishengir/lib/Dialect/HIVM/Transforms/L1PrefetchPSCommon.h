@@ -61,16 +61,9 @@ private:
   func::FuncOp func;
 };
 
-// These profiles preserve the operation sets of the existing ownership proofs.
-// They are not a safety proof for additional operations. A future per-operation
-// coverage proof can replace them; keep compatibility policy here, not as
-// exclusions independently maintained by each matcher.
-enum class OperationProfile : unsigned {
-  Persistent = 1,
-  Elementwise = 2,
-  Jagged = 4
-};
-
+// Inventory is structural evidence, not acceptance. Collect once at the common
+// front; ownership, effects and padding still require their corresponding
+// proof.
 // Maple4 LinalgToHFusion maps __hmf_tanhf to the same HFusion tanh as
 // math.tanh. Accept only its scalar f32 declaration and exact pointwise map;
 // readnone alone does not establish the semantics of an arbitrary call.
@@ -104,15 +97,23 @@ inline bool isMappedTanh(linalg::MapOp map) {
          decl.getFunctionType().getResult(0).isF32();
 }
 
-// Inventory is structural evidence, not acceptance. Collect once at the common
-// front; ownership, effects and padding still require their corresponding
-// proof.
+
+// The semantic exemption belongs to this exact mapped operation, not to an
+// arbitrary call with a readnone declaration.
+inline bool isMappedTanhCall(Operation *op) {
+  auto call = dyn_cast<func::CallOp>(op);
+  if (!call)
+    return false;
+  auto map = dyn_cast<linalg::MapOp>(call->getParentOp());
+  return isMappedTanh(map) && &map.getMapper().front().front() == op;
+}
+
 struct EffectInventory {
   explicit EffectInventory(func::FuncOp func) {
     func.walk([&](Operation *op) {
       if (op == func.getOperation())
         return;
-      supportedProfiles &= operationProfiles(op);
+      unsupportedOperation |= !supportedOperation(op);
       if (auto v = dyn_cast<scf::ForOp>(op))
         loops.push_back(v);
       if (auto v = dyn_cast<scf::IfOp>(op))
@@ -148,50 +149,81 @@ struct EffectInventory {
   SmallVector<bufferization::MaterializeInDestinationOp> stores;
   SmallVector<tensor::ExtractSliceOp> slices;
   SmallVector<linalg::FillOp> fills;
-  bool supports(OperationProfile profile) const {
-    return supportedProfiles & static_cast<unsigned>(profile);
-  }
+  bool hasUnsupportedOperation() const { return unsupportedOperation; }
 
 private:
-  static unsigned operationProfiles(Operation *op) {
-    constexpr unsigned persistent =
-        static_cast<unsigned>(OperationProfile::Persistent);
-    constexpr unsigned elementwise =
-        static_cast<unsigned>(OperationProfile::Elementwise);
-    constexpr unsigned jagged = static_cast<unsigned>(OperationProfile::Jagged);
-    StringRef name = op->getName().getStringRef();
-    if (name.starts_with("arith.") ||
-        isa<func::ReturnOp, scf::ForOp, scf::IfOp, scf::YieldOp,
-            memref::AllocOp, memref::CopyOp, memref::ReinterpretCastOp,
+  // Structural operations are checked by the existing ownership proofs and the
+  // accounted-effects walk. Arithmetic is classified by interfaces, not names.
+  static bool supportedOperation(Operation *op) {
+    if (isa<func::CallOp>(op))
+      return isMappedTanhCall(op);
+    if (isa<func::ReturnOp, scf::ForOp, scf::IfOp, scf::YieldOp,
+            memref::AllocOp, memref::CopyOp, memref::LoadOp,
             bufferization::ToTensorOp,
             bufferization::MaterializeInDestinationOp, linalg::YieldOp>(op))
-      return persistent | elementwise | jagged;
-    if (isa<linalg::FillOp>(op)) {
-      bool writesMemref = llvm::any_of(op->getOperands(), [](Value operand) {
-        return isa<MemRefType>(operand.getType());
-      });
-      return elementwise | jagged | (writesMemref ? 0 : persistent);
-    }
-    if (name == "math.exp" || isa<tensor::EmptyOp>(op))
-      return persistent | elementwise;
-    if (name == "math.tanh" || isMappedTanh(dyn_cast<linalg::MapOp>(op)))
-      return elementwise;
-    if (isa<func::CallOp>(op)) {
-      auto map = dyn_cast<linalg::MapOp>(op->getParentOp());
-      if (isMappedTanh(map) && op == &map.getMapper().front().front())
-        return elementwise;
-    }
-    if (isa<memref::SubViewOp, tensor::ExtractSliceOp>(op))
-      return elementwise | jagged;
-    if (isa<memref::LoadOp>(op))
-      return jagged;
-    return 0;
+      return true;
+    if (isa<linalg::LinalgOp>(op))
+      return true; // Buffer effects still require explicit accounting.
+    return op->getNumRegions() == 0 && op->getNumSuccessors() == 0 &&
+           isMemoryEffectFree(op);
   }
-  unsigned supportedProfiles =
-      static_cast<unsigned>(OperationProfile::Persistent) |
-      static_cast<unsigned>(OperationProfile::Elementwise) |
-      static_cast<unsigned>(OperationProfile::Jagged);
+  bool unsupportedOperation = false;
 };
+
+// Account operation identities proved by a recognizer; a type or a metadata tag
+// alone never authorizes a memory effect. Containers are traversed recursively.
+inline bool hasOnlyAccountedEffects(
+    func::FuncOp func, const llvm::SmallPtrSetImpl<Operation *> &accounted) {
+  bool valid = true;
+  func.walk([&](Operation *op) {
+    if (op == func || accounted.contains(op) || isMappedTanhCall(op) ||
+        isa<func::ReturnOp, scf::YieldOp, linalg::YieldOp>(op))
+      return;
+    if (!isMemoryEffectFree(op) ||
+        (op->getNumRegions() && !isa<linalg::LinalgOp>(op)))
+      valid = false;
+  });
+  return valid;
+}
+
+inline bool hasStagingEffects(func::FuncOp func, EffectInventory &inventory,
+                              ArrayRef<scf::IfOp> padding,
+                              ArrayRef<memref::LoadOp> metadata = {}) {
+  llvm::SmallPtrSet<Operation *, 32> accounted;
+  // These containers have already passed this schedule's exact structural
+  // proof. Accounting for a container does not skip walking its body.
+  for (auto op : inventory.loops)
+    accounted.insert(op);
+  for (auto op : inventory.ifs)
+    accounted.insert(op);
+  for (auto op : inventory.copies)
+    accounted.insert(op);
+  for (auto op : inventory.allocs)
+    accounted.insert(op);
+  for (auto op : inventory.tensors)
+    accounted.insert(op);
+  for (auto op : inventory.stores)
+    accounted.insert(op);
+  for (auto op : metadata)
+    accounted.insert(op);
+  for (auto fill : inventory.fills) {
+    if (llvm::is_contained(padding, fill->getParentOp()) &&
+        llvm::all_of(fill.getOutputs(), [&](Value output) {
+          return llvm::any_of(inventory.allocs, [&](auto alloc) {
+            return output == alloc.getResult();
+          });
+        }))
+      accounted.insert(fill);
+  }
+  return hasOnlyAccountedEffects(func, accounted);
+}
+
+inline bool initializationPrecedesRead(scf::IfOp fill, memref::CopyOp copy,
+                                      bufferization::ToTensorOp tensor) {
+  return fill && tensor && fill->getBlock() == copy->getBlock() &&
+         tensor->getBlock() == copy->getBlock() &&
+         fill->isBeforeInBlock(copy) && copy->isBeforeInBlock(tensor);
+}
 
 inline std::optional<int64_t> integer(Value value) {
   auto c = value.getDefiningOp<arith::ConstantOp>();
@@ -290,14 +322,12 @@ inline bool hasUnobservablePadding(
       }
       if (!seen.insert(user).second)
         continue;
-      StringRef name = user->getName().getStringRef();
       bool mappedTanh = isMappedTanh(dyn_cast<linalg::MapOp>(user));
-      if (user->getParentOp() != parent || user->getNumResults() != 1 ||
-          !isMemoryEffectFree(user) ||
-          (!mappedTanh &&
-           (user->getNumRegions() || !user->hasTrait<OpTrait::Elementwise>() ||
-            !(name.starts_with("arith.") || name == "math.exp" ||
-              name == "math.tanh"))))
+      if (user->getParentOp() != parent ||
+          user->getNumResults() != 1 || !isMemoryEffectFree(user) ||
+          (!mappedTanh && (user->getNumRegions() ||
+                          !user->hasTrait<OpTrait::Elementwise>() ||
+                          !isSpeculatable(user))))
         return false;
       for (Value operand : user->getOperands()) {
         auto type = dyn_cast<RankedTensorType>(operand.getType());

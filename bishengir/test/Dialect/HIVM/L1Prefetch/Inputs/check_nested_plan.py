@@ -10,7 +10,7 @@ source = Path(forward).read_text()
 def run(text, analyze=False):
     args = [opt]
     if analyze:
-        args += ["--l1-prefetch-ps-analysis"]
+        args += ["--l1-prefetch-analyze"]
     return subprocess.check_output(args, input=text, text=True)
 
 def reject(name, text, reason):
@@ -28,12 +28,14 @@ assert actual.count("program_split.selected_input") == 1
 # Strip only analysis annotations, canonicalize again to eliminate SSA name and
 # empty-attribute formatting differences, then compare the entire executable IR.
 unmarked = re.sub(r'^.*annotation.mark.*program_split.selected_input.*\n', '', actual, flags=re.M)
+# Facts contain only scalar references/literals, never an expression graph.
+unmarked = re.sub(r'l1_prefetch_ps\.(?:facts|value_roles) = \{(?:[^{}]|\{[^{}]*\})*\},? ?', '', unmarked)
 unmarked = re.sub(r'l1_prefetch_ps\.\w+(?: = "[^"]*")?,? ?', '', unmarked)
 unmarked = unmarked.replace(', }', '}').replace(' attributes {}', '').replace(' {}', '')
 assert run(unmarked) == run(source), "analysis changed executable IR"
 # Serialization followed by the registered transform also exercises a fresh
 # allocation of IR objects: the integrity stamp must not depend on C++ pointers.
-transformed = subprocess.check_output([opt, "--l1-prefetch-ps-transform"], input=actual, text=True)
+transformed = subprocess.check_output([opt, "--l1-prefetch-normalize"], input=actual, text=True)
 assert "program_split.transformed" in transformed and "program_split.launch" in transformed
 assert "l1_prefetch_ps.accepted" not in transformed
 assert "l1_prefetch_ps.proof" not in transformed
@@ -45,8 +47,8 @@ assert again == actual, "reanalysis inherited or duplicated old selection"
 print("PASS analysis-only, reanalysis, serialized handoff and transformation")
 
 reject("backward_without_contract", Path(backward).read_text(), "missing_pointer_noalias_contract")
-reject("math", source.replace("math.tanh", "math.sqrt"),
-       "nested_unsupported_memory_or_control_flow")
+# Pure arithmetic is admitted through properties, not an operation-name list.
+assert "l1_prefetch_ps.accepted" in run(source.replace("math.tanh", "math.sqrt"), True)
 reject("argument_type", source.replace("%arg11: i32", "%arg11: i64"),
        "unsupported_kernel_abi")
 reject("pointer_type", source.replace("f16", "f8E5M2"),

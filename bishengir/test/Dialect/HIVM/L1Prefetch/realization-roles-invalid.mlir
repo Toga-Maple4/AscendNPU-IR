@@ -1,5 +1,5 @@
-// RUN: bishengir-opt %s --split-input-file --program-split-mix-blockify --verify-diagnostics -o /dev/null
-// RUN: bishengir-opt %s --split-input-file --program-split-l1-materialize --verify-diagnostics -o /dev/null
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-map-programs --verify-diagnostics -o /dev/null
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-materialize --verify-diagnostics -o /dev/null
 // Malformed internal metadata is a compiler handoff error, not a new semantic
 // acceptance policy. Both lowered consumers share the same runtime diagnostics.
 // Role indices name the pristine ABI: no current-signature bound or hidden-arg

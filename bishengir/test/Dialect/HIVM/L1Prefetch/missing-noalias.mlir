@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s -split-input-file --l1-prefetch-ps-analysis | FileCheck %s
+// RUN: bishengir-opt %s -split-input-file --l1-prefetch-analyze | FileCheck %s
 
 // CHECK: l1_prefetch_ps.reject_reason = "missing_pointer_noalias_contract"
 // CHECK-NOT: program_split.selected_input

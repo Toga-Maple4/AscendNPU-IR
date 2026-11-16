@@ -1,4 +1,4 @@
-//===- L1PrefetchPSMaterialize.cpp - Ping/pong L1 data path ----------===//
+//===- L1PrefetchMaterialize.cpp - Ping/pong L1 data path ----------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "L1PrefetchPSCommon.h"
+#include "L1PrefetchPSDependencies.h"
 #include "L1PrefetchPSReservation.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
@@ -26,7 +27,7 @@
 #include <limits>
 
 namespace mlir {
-#define GEN_PASS_DEF_PROGRAMSPLITL1MATERIALIZE
+#define GEN_PASS_DEF_L1PREFETCHMATERIALIZE
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 } // namespace mlir
 
@@ -43,25 +44,6 @@ constexpr llvm::StringLiteral kLogicalId = "program_split.logical_id";
 
 bool isInside(Operation *ancestor, Operation *op) {
   return ancestor == op || ancestor->isAncestor(op);
-}
-
-LogicalResult checkCloneable(Value value, Operation *vectorScope,
-                             Value logicalId, Value loopInduction,
-                             llvm::SmallPtrSetImpl<Operation *> &seen) {
-  if (value == logicalId || value == loopInduction || isa<BlockArgument>(value))
-    return success();
-  Operation *def = value.getDefiningOp();
-  if (!def || !isInside(vectorScope, def) || !seen.insert(def).second)
-    return success();
-  if (def->getNumRegions() != 0 || def->getNumSuccessors() != 0 ||
-      (!isMemoryEffectFree(def) &&
-       !(isa<memref::LoadOp>(def) && def->hasAttr("program_split.metadata"))))
-    return failure();
-  for (Value operand : def->getOperands())
-    if (failed(checkCloneable(operand, vectorScope, logicalId, loopInduction,
-                              seen)))
-      return failure();
-  return success();
 }
 
 FailureOr<Value> cloneDependency(Value value, Operation *vectorScope,
@@ -107,8 +89,8 @@ void bindBuffer(OpBuilder &builder, Location loc, Value tensor, Value l1) {
       builder.getArrayAttr(builder.getStringAttr("bind_buffer")));
 }
 
-struct ProgramSplitL1MaterializePass
-    : impl::ProgramSplitL1MaterializeBase<ProgramSplitL1MaterializePass> {
+struct L1PrefetchMaterializePass
+    : impl::L1PrefetchMaterializeBase<L1PrefetchMaterializePass> {
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     if (!hacc::utils::isDeviceEntry(func) ||
@@ -243,18 +225,24 @@ struct ProgramSplitL1MaterializePass
 
     Value logicalId = logicalIdOp->getResult(0);
     Value physicalId = physicalIdOp->getResult(0);
-    llvm::SmallPtrSet<Operation *, 32> seen;
-    if (failed(checkCloneable(condition.getCondition(), vectorScope, logicalId,
-                              loop.getInductionVar(), seen))) {
+    auto dependencies = l1prefetch::stagingDependencies(
+        func, vectorScope, ValueRange{logicalId, loop.getInductionVar()}, loop,
+        {&vectorScope.getRegion().front(), loop.getBody()});
+    if (!dependencies.check(condition.getCondition())) {
       func.emitError("L1 pipeline error: cannot clone the selected load address slice");
       return signalPassFailure();
     }
+    // A source is cloned only inside the copied payload condition. The loop
+    // execution condition is preserved in the prologue and lookahead below.
+    auto sourceDependencies = l1prefetch::stagingDependencies(
+        func, vectorScope, ValueRange{logicalId, loop.getInductionVar()}, loop,
+        {&vectorScope.getRegion().front(), loop.getBody(),
+         &condition.getThenRegion().front()});
     for (unsigned id = 0; id < inputs; ++id)
       if (selectedAlloc[id].getType() != selectedType ||
           selectedLoads[id]->getParentOfType<scf::ForOp>() != loop ||
           selectedLoads[id]->getParentOfType<scf::IfOp>() != condition ||
-          failed(checkCloneable(selectedLoads[id].getSrc(), vectorScope,
-                                logicalId, loop.getInductionVar(), seen))) {
+          !sourceDependencies.check(selectedLoads[id].getSrc())) {
         func.emitError("program-split selected inputs lost their matched "
                        "tile/address contract");
         return signalPassFailure();
@@ -408,6 +396,15 @@ struct ProgramSplitL1MaterializePass
                            rewriter.getUnitAttr());
     Block *prologueBody = rewriter.createBlock(&prologueScope.getRegion());
     rewriter.setInsertionPointToStart(prologueBody);
+    // Loop-body arithmetic is not executed on a zero-trip source loop. Only
+    // a normalization proof (or constant bounds) permits omitting this guard.
+    // hasNext already supplies this execution condition for lookahead.
+    if (!l1prefetch::isNonemptyTileStream(loop)) {
+      Value enters = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, loop.getLowerBound(), loop.getUpperBound());
+      auto entered = rewriter.create<scf::IfOp>(loc, enters, false);
+      rewriter.setInsertionPointToStart(&entered.getThenRegion().front());
+    }
     if (failed(emitPrefetchPair(rewriter, loop.getLowerBound(), 0))) {
       func.emitError("L1 pipeline error: failed to clone the L1 prologue");
       return signalPassFailure();
@@ -532,12 +529,13 @@ struct ProgramSplitL1MaterializePass
         op.moveBefore(scope);
       rewriter.eraseOp(scope);
     };
+    loop->removeAttr(l1prefetch::kNonemptyTileStream);
     inlineScope(prologueScope);
     inlineScope(vectorScope);
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> mlir::hivm::createProgramSplitL1MaterializePass() {
-  return std::make_unique<ProgramSplitL1MaterializePass>();
+std::unique_ptr<Pass> mlir::hivm::createL1PrefetchMaterializePass() {
+  return std::make_unique<L1PrefetchMaterializePass>();
 }

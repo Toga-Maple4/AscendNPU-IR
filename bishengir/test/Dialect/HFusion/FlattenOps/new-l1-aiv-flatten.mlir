@@ -125,3 +125,28 @@ func.func @skip_host(%a: tensor<4x32xf32>, %b: tensor<4x32xf32>) -> tensor<4x32x
   %sum = linalg.elemwise_binary {fun = #linalg.binary_fn<add>} ins(%a, %b : tensor<4x32xf32>, tensor<4x32xf32>) outs(%empty : tensor<4x32xf32>) -> tensor<4x32xf32>
   return %sum : tensor<4x32xf32>
 }
+
+// -----
+
+// Preserve the elementwise/reduction boundary for VF fusion. Flattening the
+// producer alone would create an expanded, materialized intermediate in UB.
+// CHECK-LABEL: func.func @new_l1_aiv_reduction(
+// CHECK-NOT: tensor.collapse_shape
+// CHECK: %[[PRODUCT:.*]] = linalg.elemwise_binary
+// CHECK-SAME: tensor<4x32xf32>
+// CHECK-NOT: tensor.expand_shape
+// CHECK: linalg.reduce ins(%[[PRODUCT]] : tensor<4x32xf32>)
+func.func @new_l1_aiv_reduction(%a: tensor<4x32xf32>, %b: tensor<4x32xf32>) -> tensor<4xf32>
+    attributes {hivm.func_core_type = #hivm.func_core_type<AIV>, hivm.part_of_mix, program_split.transformed} {
+  %empty = tensor.empty() : tensor<4x32xf32>
+  %product = linalg.elemwise_binary {fun = #linalg.binary_fn<mul>} ins(%a, %b : tensor<4x32xf32>, tensor<4x32xf32>) outs(%empty : tensor<4x32xf32>) -> tensor<4x32xf32>
+  %zero = arith.constant 0.0 : f32
+  %out = tensor.empty() : tensor<4xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%out : tensor<4xf32>) -> tensor<4xf32>
+  %sum = linalg.reduce ins(%product : tensor<4x32xf32>) outs(%init : tensor<4xf32>) dimensions = [1]
+      (%in: f32, %acc: f32) {
+    %next = arith.addf %in, %acc : f32
+    linalg.yield %next : f32
+  }
+  return %sum : tensor<4xf32>
+}

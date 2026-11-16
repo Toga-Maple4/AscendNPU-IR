@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --program-split-l1-materialize | FileCheck %s
+// RUN: bishengir-opt %s --l1-prefetch-materialize | FileCheck %s
 //
 // Recovered GELU input captured after the standard entry adaptation, HIVM
 // conversion and MIX blockification of Inputs/recovered_gelu.mlir.

@@ -1,5 +1,6 @@
-//===- L1PrefetchPSTransform.cpp - Consume accepted structured IR --------===//
-#include "L1PrefetchPSRoles.h"
+//===- L1PrefetchNormalize.cpp - Consume accepted structured IR --------===//
+#include "L1PrefetchPSFacts.h"
+#include "L1PrefetchPSDependencies.h"
 #include "L1PrefetchPSReservation.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/IR/HACC.h"
@@ -18,7 +19,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 namespace mlir {
-#define GEN_PASS_DEF_L1PREFETCHPSTRANSFORM
+#define GEN_PASS_DEF_L1PREFETCHNORMALIZE
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 } // namespace mlir
 using namespace mlir;
@@ -77,7 +78,8 @@ struct Selection {
   Value rowBound;
   BlockArgument flatBound;
   hivm::l1prefetch::AccessRoles roles;
-  int64_t logicalPrograms = 0, persistentSteps = 0, rowTasks = 0;
+  Value logicalPrograms, persistentSteps, rowTasks;
+  bool runtimePersistent = false;
 };
 FailureOr<Selection> readSelection(func::FuncOp func,
                                    hivm::l1prefetch::KernelLayout &layout) {
@@ -108,7 +110,8 @@ FailureOr<Selection> readSelection(func::FuncOp func,
       malformed |= !s.active;
     }
   });
-  bool flat = func->hasAttr("l1_prefetch_ps.flat");
+  bool program = func->hasAttr("l1_prefetch_ps.program");
+  bool flat = func->hasAttr("l1_prefetch_ps.flat") || program;
   if (malformed || outer != (flat ? 0u : 1u) || load < 1 ||
       (!inner && !flat && load > 1u) || inner > 1 ||
       active != ((inner || flat) ? 0 : 1))
@@ -133,41 +136,95 @@ FailureOr<Selection> readSelection(func::FuncOp func,
   if (stores != 1)
     return failure();
   using hivm::l1prefetch::AccessSchedule;
-  auto schedule = flat ? AccessSchedule::Flat
+  auto schedule = program ? AccessSchedule::Program
+                  : flat ? AccessSchedule::Flat
                   : func->hasAttr("l1_prefetch_ps.jagged")
                       ? AccessSchedule::Jagged
                   : s.inner ? AccessSchedule::Nested
                             : AccessSchedule::Persistent;
-  if (!hivm::l1prefetch::deriveAccessRoles(func, layout, schedule, s.loads,
-                                           store, s.outer, s.inner, metadata,
-                                           s.tile, s.roles)
-           .empty())
+  auto facts = hivm::l1prefetch::decodeAcceptedFacts(func, layout);
+  if (failed(facts) || facts->schedule != schedule)
     return failure();
-  if (flat) {
+  s.roles = facts->roles;
+  // Check the physical handoff, not the address/ownership proof a second time.
+  if (s.outer && (s.outer->getParentOp() != func ||
+      (schedule == AccessSchedule::Jagged ? s.outer.getNumRegionIterArgs() != 1
+                                         : s.outer.getNumResults() != 0)))
+    return failure();
+  if (s.inner && (s.inner->getParentOp() != s.outer ||
+      (schedule == AccessSchedule::Jagged ? s.inner.getNumRegionIterArgs() != 2
+                                         : s.inner.getNumResults() != 0)))
+    return failure();
+  Operation *payload = flat ? func.getOperation() : s.inner.getOperation();
+  if (schedule == AccessSchedule::Persistent) {
+    auto work = dyn_cast<scf::IfOp>(store->getParentOp());
+    if (!work || work->getParentOp() != s.outer || work.getNumResults() ||
+        !work.getElseRegion().empty() || work.getCondition() != s.active.getResult())
+      return failure();
+    payload = work;
+    auto n = hivm::l1prefetch::integer(facts->logicalPrograms);
+    auto steps = hivm::l1prefetch::integer(facts->persistentSteps);
+    auto tasks = hivm::l1prefetch::integer(facts->rowTasks);
+    if (facts->persistentSteps != s.outer.getUpperBound() ||
+        facts->rowTasks != s.active.getRhs())
+      return failure();
+    s.logicalPrograms = facts->logicalPrograms;
+    s.persistentSteps = facts->persistentSteps;
+    s.rowTasks = facts->rowTasks;
+    s.runtimePersistent = !n || !steps || !tasks;
+  }
+  auto outputView = hivm::l1prefetch::accessView(store.getDest());
+  if (!outputView || store->getParentOp() != payload ||
+      outputView.getSource() != s.roles.output)
+    return failure();
+  SmallVector<Value> pointers;
+  for (auto copy : s.loads) {
+    auto view = hivm::l1prefetch::accessView(copy.getSource());
+    if (!view || copy->getParentOp() != payload ||
+        !llvm::is_contained(s.roles.inputs, view.getSource()) ||
+        llvm::is_contained(pointers, view.getSource()))
+      return failure();
+    pointers.push_back(view.getSource());
+    Value target = copy.getTarget();
+    if (auto sub = target.getDefiningOp<memref::SubViewOp>())
+      target = sub.getSource();
+    auto alloc = target.getDefiningOp<memref::AllocOp>();
+    if (!alloc || alloc->getParentOp() != payload)
+      return failure();
+    for (auto *user : alloc->getUsers())
+      if (auto tensor = dyn_cast<bufferization::ToTensorOp>(user))
+        if (tensor->getParentOp() != payload)
+          return failure();
+  }
+  if (auto slice = store.getSource().getDefiningOp<tensor::ExtractSliceOp>();
+      slice && slice->getParentOp() != payload)
+    return failure();
+  if (schedule == AccessSchedule::Jagged)
+    for (auto load : metadata)
+      if (load->getParentOp() != func)
+        return failure();
+  if (pointers.size() != s.roles.inputs.size())
+    return failure();
+  func.walk([&](Operation *op) {
+    if (!op->hasAttr("l1_prefetch_ps.padding"))
+      return;
+    auto guard = dyn_cast<scf::IfOp>(op);
+    if (!guard || guard->getParentOp() != payload || guard.getNumResults() ||
+        !guard.getElseRegion().empty() ||
+        std::distance(guard.getThenRegion().front().begin(),
+                      guard.getThenRegion().front().end()) != 2 ||
+        !isa<linalg::FillOp>(guard.getThenRegion().front().front()) ||
+        !isa<scf::YieldOp>(guard.getThenRegion().front().back()))
+      malformed = true;
+  });
+  if (malformed)
+    return failure();
+  if (flat && !program) {
     s.flatBound = dyn_cast<BlockArgument>(s.roles.size);
     if (!s.flatBound)
       return failure();
   } else if (schedule == AccessSchedule::Nested) {
     s.rowBound = s.roles.rows;
-  } else if (!flat && !s.inner) {
-    auto row = s.active.getLhs().getDefiningOp<arith::AddIOp>();
-    if (!row)
-      return failure();
-    Value pid = layout.programId();
-    Value other = row.getLhs() == pid ? row.getRhs() : row.getLhs();
-    auto mul = other.getDefiningOp<arith::MulIOp>();
-    if (!mul)
-      return failure();
-    auto logical = hivm::l1prefetch::integer(mul.getLhs());
-    if (!logical)
-      logical = hivm::l1prefetch::integer(mul.getRhs());
-    auto steps = hivm::l1prefetch::integer(s.outer.getUpperBound());
-    auto tasks = hivm::l1prefetch::integer(s.active.getRhs());
-    if (!logical || !steps || !tasks)
-      return failure();
-    s.logicalPrograms = *logical;
-    s.persistentSteps = *steps;
-    s.rowTasks = *tasks;
   }
   return s;
 }
@@ -201,29 +258,27 @@ std::string mlir::hivm::l1PrefetchPSFingerprint(func::FuncOp func) {
   return digest.str().str();
 }
 
-LogicalResult mlir::hivm::verifyL1PrefetchPSAcceptance(func::FuncOp func) {
-  auto layout = l1prefetch::KernelLayout::get(func);
+namespace {
+FailureOr<Selection> readAcceptedSelection(func::FuncOp func) {
+  auto layout = hivm::l1prefetch::KernelLayout::get(func);
   auto proof = func->getAttrOfType<StringAttr>(kProof);
-  if (!func->hasAttrOfType<UnitAttr>("l1_prefetch_ps.accepted") || !proof ||
-      proof.getValue() != l1PrefetchPSFingerprint(func) || !layout ||
-      failed(readSelection(func, *layout)))
-    return func.emitError("L1 pipeline error: missing, stale or inconsistent "
-                          "accepted analysis metadata");
-  return success();
+  if (func->hasAttrOfType<UnitAttr>("l1_prefetch_ps.accepted") && proof &&
+      proof.getValue() == hivm::l1PrefetchPSFingerprint(func) && layout) {
+    auto selected = readSelection(func, *layout);
+    if (succeeded(selected))
+      return selected;
+  }
+  func.emitError("L1 pipeline error: missing, stale or inconsistent accepted analysis metadata");
+  return failure();
+}
+} // namespace
+LogicalResult mlir::hivm::verifyL1PrefetchPSAcceptance(func::FuncOp func) {
+  return success(succeeded(readAcceptedSelection(func)));
 }
 
 namespace {
-FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func) {
+FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func, const Selection &s) {
   using namespace mlir::hivm;
-  if (failed(verifyL1PrefetchPSAcceptance(func)))
-    return failure();
-  auto layout = l1prefetch::KernelLayout::get(func);
-  if (!layout)
-    return failure();
-  auto selection = readSelection(func, *layout);
-  if (failed(selection))
-    return failure();
-  Selection s = *selection;
   Builder b(func.getContext());
   NamedAttrList attrs;
   auto put = [&](StringRef name, int64_t value) {
@@ -260,12 +315,19 @@ FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func) {
     }
     return true;
   };
-  if (func->hasAttr("l1_prefetch_ps.flat")) {
+  if (func->hasAttr("l1_prefetch_ps.flat") ||
+      func->hasAttr("l1_prefetch_ps.program")) {
     auto type = s.tile;
-    put("flat_tile", 1);
-    put("tile_elements", type.getDimSize(0));
+    bool program = func->hasAttr("l1_prefetch_ps.program");
+    put(program ? "program_tile" : "flat_tile", 1);
+    if (program) {
+      put("tile_rows", type.getDimSize(0));
+      put("tile_cols", type.getDimSize(1));
+    } else {
+      put("tile_elements", type.getDimSize(0));
+      put("size_arg", s.flatBound.getArgNumber());
+    }
     put("element_bits", type.getElementTypeBitWidth());
-    put("size_arg", s.flatBound.getArgNumber());
     auto target =
         hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
     if (!target)
@@ -303,10 +365,37 @@ FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func) {
     return attrs.getDictionary(func.getContext());
   }
   if (!s.inner) {
-    put("logical_programs", s.logicalPrograms);
-    put("physical_programs", s.logicalPrograms / 2);
-    put("persistent_steps", s.persistentSteps);
-    put("row_tasks", s.rowTasks);
+    if (s.runtimePersistent) {
+      put("persistent_runtime", 1);
+      put("tile_rows", s.tile.getDimSize(0));
+      put("tile_cols", s.tile.getDimSize(1));
+      put("element_bits", s.tile.getElementTypeBitWidth());
+      auto layout = l1prefetch::KernelLayout::get(func);
+      auto count = [&](StringRef name, Value value) {
+        if (layout)
+          for (unsigned axis = 0; axis < 3; ++axis)
+            if (value == layout->gridDim(axis)) {
+              put((name + "_grid").str(), axis);
+              return true;
+            }
+        return scalar((name + "_arg").str(), ("static_" + name).str(), value);
+      };
+      if (!count("logical_programs", s.logicalPrograms) ||
+          !count("persistent_steps", s.persistentSteps) ||
+          !count("row_tasks", s.rowTasks))
+        return failure();
+      // Persistent's partition theorem requires a static row stride and column
+      // count. Do not advertise an argument encoding that it cannot support.
+      auto stride = getConstantIntValue(s.roles.stride);
+      if (!stride)
+        return failure();
+      put("row_stride", *stride);
+    } else {
+      put("logical_programs", *l1prefetch::integer(s.logicalPrograms));
+      put("physical_programs", *l1prefetch::integer(s.logicalPrograms) / 2);
+      put("persistent_steps", *l1prefetch::integer(s.persistentSteps));
+      put("row_tasks", *l1prefetch::integer(s.rowTasks));
+    }
   } else {
     MemRefType tile = s.tile;
     put("tile_rows", tile.getDimSize(0));
@@ -329,14 +418,11 @@ mlir::hivm::getL1PrefetchPSLaunchContract(
     func::FuncOp func, hacc::HACCTargetDeviceSpecInterface targetSpec,
     std::string &rejectReason) {
   rejectReason.clear();
-  auto contract = getRealizationContract(func);
-  if (failed(contract))
-    return failure();
-  auto layout = l1prefetch::KernelLayout::get(func);
-  if (!layout)
-    return failure();
-  auto selection = readSelection(func, *layout);
+  auto selection = readAcceptedSelection(func);
   if (failed(selection))
+    return failure();
+  auto contract = getRealizationContract(func, *selection);
+  if (failed(contract))
     return failure();
   // The driver supplies the same requested-target spec that AppendDeviceSpec
   // installs before physical planning. Do not trust a stale spec in input IR.
@@ -351,12 +437,7 @@ mlir::hivm::getL1PrefetchPSLaunchContract(
 
 FailureOr<DictionaryAttr>
 mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
-  if (failed(verifyL1PrefetchPSAcceptance(func)))
-    return failure();
-  auto layout = l1prefetch::KernelLayout::get(func);
-  if (!layout)
-    return failure();
-  auto selected = readSelection(func, *layout);
+  auto selected = readAcceptedSelection(func);
   if (failed(selected))
     return failure();
   auto &s = *selected;
@@ -383,6 +464,13 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
     StringRef key;
     if (auto v = dyn_cast<Value>(value)) {
       if (auto arg = dyn_cast<BlockArgument>(v)) {
+        auto layout = l1prefetch::KernelLayout::get(func);
+        if (s.runtimePersistent && layout)
+          for (unsigned axis = 0; axis < 3; ++axis)
+            if (v == layout->gridDim(axis))
+              return b.getDictionaryAttr({
+                  b.getNamedAttr("grid", b.getStringAttr(StringRef("xyz").substr(axis, 1))),
+                  b.getNamedAttr("type", b.getStringAttr("i32"))});
         key = "arg";
         source = b.getI32IntegerAttr(arg.getArgNumber());
       } else if (auto constant = l1prefetch::integer(v)) {
@@ -419,15 +507,19 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
     return true;
   };
   const bool flat = func->hasAttr("l1_prefetch_ps.flat");
+  const bool program = func->hasAttr("l1_prefetch_ps.program");
   const bool jagged = func->hasAttr("l1_prefetch_ps.jagged");
-  const bool fixed = !flat && !jagged && !s.inner;
+  const bool persistent = !flat && !program && !jagged && !s.inner;
+  const bool fixed = persistent && !s.runtimePersistent;
   StringRef distribution = fixed ? "fixed"
-                                 : flat || jagged ? "resident_pairs" : "half_grid";
+                                 : flat || program || jagged ? "resident_pairs" : "half_grid";
   launch.set("distribution", b.getStringAttr(distribution));
-  launch.set("allow_odd_grid", b.getBoolAttr(flat));
+  launch.set("allow_odd_grid", b.getBoolAttr(flat || program));
+  if (program)
+    launch.set("logical_grid", b.getStringAttr("xyz"));
   if (fixed) {
-    launch.set("logical_programs", b.getI32IntegerAttr(s.logicalPrograms));
-  } else if (flat || jagged) {
+    launch.set("logical_programs", b.getI32IntegerAttr(*l1prefetch::integer(s.logicalPrograms)));
+  } else if (flat || program || jagged) {
     auto target = hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
     if (!target)
       return failure();
@@ -438,7 +530,16 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
       return failure();
     launch.set("resident_stride", cores.getValue());
   }
-  if (flat) {
+  if (program) {
+    SmallVector<Attribute> strides;
+    for (auto stride : s.roles.inputStrides) {
+      auto role = scalarRole(stride);
+      if (!role)
+        return failure();
+      strides.push_back(role);
+    }
+    roles.set("input_strides", b.getArrayAttr(strides));
+  } else if (flat) {
     if (!addScalar("size", s.roles.size))
       return failure();
   } else if (jagged) {
@@ -448,6 +549,12 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
         !addScalar("matrix_stride", s.roles.matrixStride))
       return failure();
     roles.set("offsets", offsets);
+  } else if (s.runtimePersistent) {
+    if (!addScalar("logical_programs", s.logicalPrograms) ||
+        !addScalar("persistent_steps", s.persistentSteps) ||
+        !addScalar("row_tasks", s.rowTasks) ||
+        !addScalar("stride", s.roles.stride))
+      return failure();
   } else if (!fixed) {
     if (!addScalar("rows", s.roles.rows) || !addScalar("cols", s.roles.cols) ||
         !addScalar("stride", s.roles.stride))
@@ -456,12 +563,12 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
   tile.set("rows", b.getI64IntegerAttr(flat ? 1 : s.tile.getDimSize(0)));
   tile.set("cols", b.getI64IntegerAttr(s.tile.getDimSize(flat ? 0 : 1)));
   tile.set("element_bits", b.getI32IntegerAttr(s.tile.getElementTypeBitWidth()));
-  StringRef kind = fixed ? "fixed_programs"
-                         : flat ? "flat_tiles"
+  StringRef kind = s.runtimePersistent ? "persistent_tiles" : fixed ? "fixed_programs"
+                         : program ? "program_tiles" : flat ? "flat_tiles"
                                 : jagged ? "metadata_bounded_tiles" : "tiles_2d";
   guard.set("kind", b.getStringAttr(kind));
-  bool partial = flat || jagged ||
-                 (!fixed && l1prefetch::nestedTileMode(s.roles, s.tile) ==
+  bool partial = flat || program || jagged ||
+                 (!persistent && l1prefetch::nestedTileMode(s.roles, s.tile) ==
                                 l1prefetch::NestedTileMode::Partial);
   guard.set("tile_mode", b.getStringAttr(partial ? "partial" : "full"));
   guard.set("tile", tile.getDictionary(func.getContext()));
@@ -489,19 +596,24 @@ void normalizeFlat(func::FuncOp func, hivm::l1prefetch::KernelLayout &layout,
   Value one = b.create<arith::ConstantIntOp>(loc, 1, 32);
   auto loop = b.create<scf::ForOp>(loc, zero, one, one);
   b.setInsertionPointToStart(loop.getBody());
-  Value pid = layout.programId();
-  Value grid = layout.gridDim();
-  Value width = b.create<arith::ConstantIntOp>(
-      loc, contract.getAs<IntegerAttr>("tile_elements").getInt(), 64);
-  Value widePid = b.create<arith::ExtSIOp>(loc, b.getI64Type(), pid);
-  Value offset = b.create<arith::MulIOp>(loc, widePid, width);
-  Value size = s.roles.size;
-  Value inGrid =
-      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, pid, grid);
-  Value wideSize = b.create<arith::ExtSIOp>(loc, b.getI64Type(), size);
-  Value inRange =
-      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, offset, wideSize);
-  Value active = b.create<arith::AndIOp>(loc, inGrid, inRange);
+  Value active;
+  if (contract.contains("program_tile")) {
+    for (unsigned axis = 0; axis < 3; ++axis) {
+      Value inGrid = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, layout.programId(axis), layout.gridDim(axis));
+      active = active ? b.create<arith::AndIOp>(loc, active, inGrid) : inGrid;
+    }
+  } else {
+    Value pid = layout.programId(), grid = layout.gridDim();
+    Value width = b.create<arith::ConstantIntOp>(
+        loc, contract.getAs<IntegerAttr>("tile_elements").getInt(), 64);
+    Value widePid = b.create<arith::ExtSIOp>(loc, b.getI64Type(), pid);
+    Value offset = b.create<arith::MulIOp>(loc, widePid, width);
+    Value inGrid = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, pid, grid);
+    Value wideSize = b.create<arith::ExtSIOp>(loc, b.getI64Type(), s.roles.size);
+    Value inRange = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, offset, wideSize);
+    active = b.create<arith::AndIOp>(loc, inGrid, inRange);
+  }
   auto work = b.create<scf::IfOp>(loc, active, false);
   b.setInsertionPointToStart(&work.getThenRegion().front());
   IRMapping mapping;
@@ -561,6 +673,10 @@ void normalizeJagged(func::FuncOp func, Selection s) {
       loc, b.create<arith::AddIOp>(loc, denseRows, rowPad), bm);
   Value steps = b.create<arith::MulIOp>(loc, rowTiles, columns);
   auto loop = b.create<scf::ForOp>(loc, zero, steps, one);
+  // The corresponding schema-2 launcher proves positive row/column task
+  // counts and their non-overflowing product (tiles_2d / metadata_bounded_tiles).
+  // Record only loop entry; do not infer ranges for arbitrary SSA factors.
+  loop->setAttr(hivm::l1prefetch::kNonemptyTileStream, b.getUnitAttr());
   b.setInsertionPointToStart(loop.getBody());
   Value row = b.create<arith::MulIOp>(
       loc, bm, b.create<arith::DivSIOp>(loc, loop.getInductionVar(), columns));
@@ -630,6 +746,10 @@ void normalizeNested(func::FuncOp func, Selection s) {
   Value rounds = b.create<arith::DivSIOp>(loc, rounded, grid);
   Value steps = b.create<arith::MulIOp>(loc, rounds, columns);
   auto loop = b.create<scf::ForOp>(loc, zero, steps, one);
+  // The corresponding schema-2 launcher proves positive row/column task
+  // counts and their non-overflowing product (tiles_2d / metadata_bounded_tiles).
+  // Record only loop entry; do not infer ranges for arbitrary SSA factors.
+  loop->setAttr(hivm::l1prefetch::kNonemptyTileStream, b.getUnitAttr());
   b.setInsertionPointToStart(loop.getBody());
   Value round = b.create<arith::DivSIOp>(loc, loop.getInductionVar(), columns);
   Value column = b.create<arith::RemSIOp>(loc, loop.getInductionVar(), columns);
@@ -679,8 +799,8 @@ void normalizeNested(func::FuncOp func, Selection s) {
   b.eraseOp(s.outer);
 }
 
-struct L1PrefetchPSTransformPass
-    : impl::L1PrefetchPSTransformBase<L1PrefetchPSTransformPass> {
+struct L1PrefetchNormalizePass
+    : impl::L1PrefetchNormalizeBase<L1PrefetchNormalizePass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     auto func = hivm::getL1PrefetchPSEntry(module);
@@ -688,17 +808,24 @@ struct L1PrefetchPSTransformPass
       module.emitError("L1 pipeline error: expected one accepted entry");
       return signalPassFailure();
     }
-    auto contract = getRealizationContract(func);
+    auto selection = readAcceptedSelection(func);
+    if (failed(selection))
+      return signalPassFailure();
+    auto contract = getRealizationContract(func, *selection);
     if (failed(contract))
       return signalPassFailure();
     auto layout = hivm::l1prefetch::KernelLayout::get(func);
     if (!layout)
       return signalPassFailure();
-    auto selection = readSelection(func, *layout);
-    if (failed(selection))
-      return signalPassFailure();
     Selection s = *selection;
-    if (func->hasAttr("l1_prefetch_ps.flat"))
+    // Every accepted launcher checks positive grid dimensions and a bounded
+    // grid product. Preserve their verified ABI identities through ID lowering.
+    for (unsigned axis = 0; axis < 3; ++axis)
+      func.setArgAttr(layout->gridDim(axis).getArgNumber(),
+                      hivm::l1prefetch::kLaunchGridAxis,
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 32), axis));
+    if (func->hasAttr("l1_prefetch_ps.flat") ||
+        func->hasAttr("l1_prefetch_ps.program"))
       normalizeFlat(func, *layout, s, *contract);
     else if (func->hasAttr("l1_prefetch_ps.jagged"))
       normalizeJagged(func, s);
@@ -726,6 +853,6 @@ struct L1PrefetchPSTransformPass
   }
 };
 } // namespace
-std::unique_ptr<Pass> mlir::hivm::createL1PrefetchPSTransformPass() {
-  return std::make_unique<L1PrefetchPSTransformPass>();
+std::unique_ptr<Pass> mlir::hivm::createL1PrefetchNormalizePass() {
+  return std::make_unique<L1PrefetchNormalizePass>();
 }

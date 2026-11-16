@@ -63,8 +63,8 @@ namespace mlir {
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 
 namespace hivm {
-std::unique_ptr<Pass> createL1PrefetchPSAnalysisPass();
-std::unique_ptr<Pass> createL1PrefetchPSTransformPass();
+std::unique_ptr<Pass> createL1PrefetchAnalyzePass();
+std::unique_ptr<Pass> createL1PrefetchNormalizePass();
 /// Create a pass to infer the core type of each function.
 std::unique_ptr<Pass> createInferFuncCoreTypePass();
 
@@ -375,10 +375,10 @@ std::unique_ptr<Pass> createInsertNZ2NDForDebugPass();
 std::unique_ptr<Pass> createInsertL12UBForDebugPass();
 
 /// Assign each MIX vector subcore one complete logical program.
-std::unique_ptr<Pass> createProgramSplitMixBlockifyPass();
-std::unique_ptr<Pass> createProgramSplitL1MaterializePass();
-std::unique_ptr<Pass> createProgramSplitL1FinalizeSyncPass();
-std::unique_ptr<Pass> createProgramSplitL1ConsumerSyncPass();
+std::unique_ptr<Pass> createL1PrefetchMapProgramsPass();
+std::unique_ptr<Pass> createL1PrefetchMaterializePass();
+std::unique_ptr<Pass> createL1PrefetchBalanceSyncPass();
+std::unique_ptr<Pass> createL1PrefetchConsumerHandoffPass();
 /// Distribute parallel loop work across hardware blocks.
 std::unique_ptr<Pass> createAutoBlockifyParallelLoopPass();
 

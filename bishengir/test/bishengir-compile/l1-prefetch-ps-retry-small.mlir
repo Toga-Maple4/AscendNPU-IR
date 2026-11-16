@@ -1,11 +1,11 @@
 // A bounded runtime-sized candidate: four logical workers become two MIX
 // blocks, eight persistent steps are scheduled, and row_tasks=6 makes the
 // final four steps execute only logical workers 0 and 1.
-// RUN: bishengir-compile %s --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=program-split-mix-blockify --mlir-print-ir-after=program-split-l1-materialize -o %t.o 2>&1 | FileCheck %s --check-prefix=IR
+// RUN: bishengir-compile %s --target=Ascend950PR_9579 --enable-lib-call-no-inline=false --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --enable-auto-blockify-loop=true --enable-auto-multi-buffer=true --enable-program-split-mix=true --mlir-print-ir-after=l1-prefetch-map-programs --mlir-print-ir-after=l1-prefetch-materialize -o %t.o 2>&1 | FileCheck %s --check-prefix=IR
 // RUN: python3 %S/Inputs/l1-contract/check.py %S/Inputs/l1-contract/retry-small.json %t.o.program_split.json
 // IR: %[[HALF:.*]] = arith.constant {program_split.physical_count} 2 : i32
 // IR: %{{.*}} = arith.muli %{{.*}}, %[[HALF]] : i32
-// IR: IR Dump After ProgramSplitL1Materialize
+// IR: IR Dump After L1PrefetchMaterialize
 // IR: %[[FIVE:.*]] = arith.constant 8 : i32
 // IR: scf.for %[[IV:.*]] = %{{.*}} to %[[FIVE]] step %{{.*}}
 // IR: %[[NEXT:.*]] = arith.addi %[[IV]], %{{.*}} : i32

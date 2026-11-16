@@ -1,4 +1,4 @@
-// RUN: bishengir-opt %s --split-input-file --program-split-l1-materialize --verify-diagnostics
+// RUN: bishengir-opt %s --split-input-file --l1-prefetch-materialize --verify-diagnostics
 // Both flat and rank-2 payloads use the same physical bank-capacity check.
 module attributes {dlti.target_system_spec = #dlti.target_system_spec<"NPU" : #hacc.target_device_spec<#dlti.dl_entry<"L1_SIZE", 4194304 : i32>, #dlti.dl_entry<"L1_ALIGN_SIZE", 256 : i32>>>} {
   // expected-error @+1 {{L1 pipeline error: ping/pong reservation exceeds target L1 capacity}}

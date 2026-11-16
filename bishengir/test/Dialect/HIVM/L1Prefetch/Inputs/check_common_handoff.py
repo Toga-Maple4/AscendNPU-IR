@@ -9,7 +9,7 @@ outer, guarded = (Path(p).read_text() for p in (outer_path, guarded_path))
 
 
 def run(source, *extra):
-    return subprocess.run([opt, '--program-split-l1-consumer-sync', *extra],
+    return subprocess.run([opt, '--l1-prefetch-consumer-handoff', *extra],
                           input=source, text=True, capture_output=True)
 
 
