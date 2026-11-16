@@ -70,10 +70,14 @@ namespace {
 constexpr StringLiteral kProof = "l1_prefetch_ps.proof";
 // These objects only view the current accepted IR. They are never retained
 // across passes or clones and perform no semantic eligibility analysis.
+using hivm::l1prefetch::AccessSchedule;
 struct Selection {
   scf::ForOp outer, inner;
   SmallVector<memref::CopyOp, 2> loads;
+  bufferization::MaterializeInDestinationOp store;
+  SmallVector<memref::LoadOp> metadata;
   arith::CmpIOp active;
+  AccessSchedule schedule;
   MemRefType tile;
   Value rowBound;
   BlockArgument flatBound;
@@ -81,152 +85,234 @@ struct Selection {
   Value logicalPrograms, persistentSteps, rowTasks;
   bool runtimePersistent = false;
 };
-FailureOr<Selection> readSelection(func::FuncOp func,
-                                   hivm::l1prefetch::KernelLayout &layout) {
-  Selection s;
-  unsigned outer = 0, inner = 0, load = 0, active = 0;
-  bool malformed = false;
-  func.walk([&](Operation *op) {
+
+LogicalResult handoffFailure(std::string &reason, const Twine &message) {
+  reason = message.str();
+  return failure();
+}
+
+AccessSchedule inferSchedule(func::FuncOp func, const Selection &selection) {
+  if (func->hasAttr("l1_prefetch_ps.program"))
+    return AccessSchedule::Program;
+  if (func->hasAttr("l1_prefetch_ps.flat"))
+    return AccessSchedule::Flat;
+  if (func->hasAttr("l1_prefetch_ps.jagged"))
+    return AccessSchedule::Jagged;
+  return selection.inner ? AccessSchedule::Nested : AccessSchedule::Persistent;
+}
+
+LogicalResult collectSelection(func::FuncOp func, Selection &selection,
+                               std::string &reason) {
+  unsigned outer = 0, inner = 0, loads = 0, active = 0, stores = 0;
+  auto walk = func.walk([&](Operation *op) -> WalkResult {
     if (op->hasAttr("l1_prefetch_ps.outer")) {
       ++outer;
-      s.outer = dyn_cast<scf::ForOp>(op);
-      malformed |= !s.outer;
+      selection.outer = dyn_cast<scf::ForOp>(op);
+      if (!selection.outer) {
+        reason = "outer marker must name an scf.for";
+        return WalkResult::interrupt();
+      }
     }
     if (op->hasAttr("l1_prefetch_ps.inner")) {
       ++inner;
-      s.inner = dyn_cast<scf::ForOp>(op);
-      malformed |= !s.inner;
+      selection.inner = dyn_cast<scf::ForOp>(op);
+      if (!selection.inner) {
+        reason = "inner marker must name an scf.for";
+        return WalkResult::interrupt();
+      }
     }
     if (op->hasAttr("l1_prefetch_ps.load")) {
-      ++load;
+      ++loads;
       auto copy = dyn_cast<memref::CopyOp>(op);
-      malformed |= !copy;
-      if (copy)
-        s.loads.push_back(copy);
+      if (!copy) {
+        reason = "load marker must name a memref.copy";
+        return WalkResult::interrupt();
+      }
+      selection.loads.push_back(copy);
     }
     if (op->hasAttr("l1_prefetch_ps.active")) {
       ++active;
-      s.active = dyn_cast<arith::CmpIOp>(op);
-      malformed |= !s.active;
+      selection.active = dyn_cast<arith::CmpIOp>(op);
+      if (!selection.active) {
+        reason = "active marker must name an arith.cmpi";
+        return WalkResult::interrupt();
+      }
     }
+    if (auto store = dyn_cast<bufferization::MaterializeInDestinationOp>(op)) {
+      ++stores;
+      selection.store = store;
+    }
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      selection.metadata.push_back(load);
+    return WalkResult::advance();
   });
-  bool program = func->hasAttr("l1_prefetch_ps.program");
-  bool flat = func->hasAttr("l1_prefetch_ps.flat") || program;
-  if (malformed || outer != (flat ? 0u : 1u) || load < 1 ||
-      (!inner && !flat && load > 1u) || inner > 1 ||
-      active != ((inner || flat) ? 0 : 1))
-    return failure();
-  for (auto loadOp : s.loads) {
-    Value target = loadOp.getTarget();
+  if (walk.wasInterrupted())
+    return failure(); // The marker type diagnostic is already recorded.
+
+  selection.schedule = inferSchedule(func, selection);
+  bool loopless = selection.schedule == AccessSchedule::Flat ||
+                  selection.schedule == AccessSchedule::Program;
+  if (outer != (loopless ? 0u : 1u))
+    return handoffFailure(reason, "unexpected outer marker count");
+  if (!loads || (!inner && !loopless && loads > 1))
+    return handoffFailure(reason, "unexpected selected load count");
+  if (inner > 1)
+    return handoffFailure(reason, "multiple inner markers");
+  if (active != ((inner || loopless) ? 0u : 1u))
+    return handoffFailure(reason, "unexpected active marker count");
+  if (stores != 1)
+    return handoffFailure(reason, "expected one completion store");
+  for (auto copy : selection.loads) {
+    Value target = copy.getTarget();
     if (auto slice = target.getDefiningOp<memref::SubViewOp>())
       target = slice.getSource();
     auto type = dyn_cast<MemRefType>(target.getType());
-    if (!type || (s.tile && s.tile != type))
-      return failure();
-    s.tile = type;
+    if (!type || (selection.tile && selection.tile != type))
+      return handoffFailure(
+          reason, "selected buffers must share a memref tile type");
+    selection.tile = type;
   }
-  bufferization::MaterializeInDestinationOp store;
-  SmallVector<memref::LoadOp> metadata;
-  unsigned stores = 0;
-  func.walk([&](bufferization::MaterializeInDestinationOp op) {
-    ++stores;
-    store = op;
-  });
-  func.walk([&](memref::LoadOp op) { metadata.push_back(op); });
-  if (stores != 1)
-    return failure();
-  using hivm::l1prefetch::AccessSchedule;
-  auto schedule = program ? AccessSchedule::Program
-                  : flat ? AccessSchedule::Flat
-                  : func->hasAttr("l1_prefetch_ps.jagged")
-                      ? AccessSchedule::Jagged
-                  : s.inner ? AccessSchedule::Nested
-                            : AccessSchedule::Persistent;
-  auto facts = hivm::l1prefetch::decodeAcceptedFacts(func, layout);
-  if (failed(facts) || facts->schedule != schedule)
-    return failure();
-  s.roles = facts->roles;
-  // Check the physical handoff, not the address/ownership proof a second time.
-  if (s.outer && (s.outer->getParentOp() != func ||
-      (schedule == AccessSchedule::Jagged ? s.outer.getNumRegionIterArgs() != 1
-                                         : s.outer.getNumResults() != 0)))
-    return failure();
-  if (s.inner && (s.inner->getParentOp() != s.outer ||
-      (schedule == AccessSchedule::Jagged ? s.inner.getNumRegionIterArgs() != 2
-                                         : s.inner.getNumResults() != 0)))
-    return failure();
-  Operation *payload = flat ? func.getOperation() : s.inner.getOperation();
-  if (schedule == AccessSchedule::Persistent) {
-    auto work = dyn_cast<scf::IfOp>(store->getParentOp());
-    if (!work || work->getParentOp() != s.outer || work.getNumResults() ||
-        !work.getElseRegion().empty() || work.getCondition() != s.active.getResult())
-      return failure();
+  return success();
+}
+
+LogicalResult checkLoopNesting(func::FuncOp func, Selection &selection,
+                              std::string &reason) {
+  bool jagged = selection.schedule == AccessSchedule::Jagged;
+  if (selection.outer) {
+    if (selection.outer->getParentOp() != func)
+      return handoffFailure(
+          reason, "outer loop must be directly inside the function");
+    bool validResults = jagged ? selection.outer.getNumRegionIterArgs() == 1
+                               : selection.outer.getNumResults() == 0;
+    if (!validResults)
+      return handoffFailure(reason, "unexpected outer loop result count");
+  }
+  if (selection.inner) {
+    if (selection.inner->getParentOp() != selection.outer)
+      return handoffFailure(
+          reason, "inner loop must be directly inside the outer loop");
+    bool validResults = jagged ? selection.inner.getNumRegionIterArgs() == 2
+                               : selection.inner.getNumResults() == 0;
+    if (!validResults)
+      return handoffFailure(reason, "unexpected inner loop result count");
+  }
+  return success();
+}
+
+// A work/padding guard contributes no values and has no alternative payload.
+bool isThenOnlyGuard(scf::IfOp guard, Operation *parent) {
+  return guard && guard->getParentOp() == parent && !guard.getNumResults() &&
+         guard.getElseRegion().empty();
+}
+
+bool isFillOnlyPaddingGuard(Operation *op, Operation *payload) {
+  auto guard = dyn_cast<scf::IfOp>(op);
+  if (!isThenOnlyGuard(guard, payload))
+    return false;
+  auto &body = guard.getThenRegion().front();
+  return std::distance(body.begin(), body.end()) == 2 &&
+         isa<linalg::FillOp>(body.front()) && isa<scf::YieldOp>(body.back());
+}
+
+LogicalResult checkPayload(func::FuncOp func, Selection &selection,
+                           const hivm::l1prefetch::AcceptedFacts &facts,
+                           std::string &reason) {
+  bool loopless = selection.schedule == AccessSchedule::Flat ||
+                  selection.schedule == AccessSchedule::Program;
+  Operation *payload =
+      loopless ? func.getOperation() : selection.inner.getOperation();
+  if (selection.schedule == AccessSchedule::Persistent) {
+    auto work = dyn_cast<scf::IfOp>(selection.store->getParentOp());
+    if (!isThenOnlyGuard(work, selection.outer) ||
+        work.getCondition() != selection.active.getResult())
+      return handoffFailure(
+          reason, "persistent work guard must use the active marker");
     payload = work;
-    auto n = hivm::l1prefetch::integer(facts->logicalPrograms);
-    auto steps = hivm::l1prefetch::integer(facts->persistentSteps);
-    auto tasks = hivm::l1prefetch::integer(facts->rowTasks);
-    if (facts->persistentSteps != s.outer.getUpperBound() ||
-        facts->rowTasks != s.active.getRhs())
-      return failure();
-    s.logicalPrograms = facts->logicalPrograms;
-    s.persistentSteps = facts->persistentSteps;
-    s.rowTasks = facts->rowTasks;
-    s.runtimePersistent = !n || !steps || !tasks;
+    if (facts.persistentSteps != selection.outer.getUpperBound() ||
+        facts.rowTasks != selection.active.getRhs())
+      return handoffFailure(
+          reason, "persistent counts disagree with loop bound or active test");
+    selection.logicalPrograms = facts.logicalPrograms;
+    selection.persistentSteps = facts.persistentSteps;
+    selection.rowTasks = facts.rowTasks;
+    selection.runtimePersistent = !hivm::l1prefetch::integer(facts.logicalPrograms) ||
+                                  !hivm::l1prefetch::integer(facts.persistentSteps) ||
+                                  !hivm::l1prefetch::integer(facts.rowTasks);
   }
-  auto outputView = hivm::l1prefetch::accessView(store.getDest());
-  if (!outputView || store->getParentOp() != payload ||
-      outputView.getSource() != s.roles.output)
-    return failure();
+  auto outputView = hivm::l1prefetch::accessView(selection.store.getDest());
+  if (!outputView || selection.store->getParentOp() != payload ||
+      outputView.getSource() != selection.roles.output)
+    return handoffFailure(
+        reason, "completion store must use the output role in the payload");
   SmallVector<Value> pointers;
-  for (auto copy : s.loads) {
+  for (auto copy : selection.loads) {
     auto view = hivm::l1prefetch::accessView(copy.getSource());
     if (!view || copy->getParentOp() != payload ||
-        !llvm::is_contained(s.roles.inputs, view.getSource()) ||
+        !llvm::is_contained(selection.roles.inputs, view.getSource()) ||
         llvm::is_contained(pointers, view.getSource()))
-      return failure();
+      return handoffFailure(
+          reason, "selected copies must use distinct input roles in the payload");
     pointers.push_back(view.getSource());
     Value target = copy.getTarget();
     if (auto sub = target.getDefiningOp<memref::SubViewOp>())
       target = sub.getSource();
     auto alloc = target.getDefiningOp<memref::AllocOp>();
     if (!alloc || alloc->getParentOp() != payload)
-      return failure();
+      return handoffFailure(
+          reason, "selected allocation must be local to the payload");
     for (auto *user : alloc->getUsers())
       if (auto tensor = dyn_cast<bufferization::ToTensorOp>(user))
         if (tensor->getParentOp() != payload)
-          return failure();
+          return handoffFailure(
+              reason, "selected tensor view must be local to the payload");
   }
-  if (auto slice = store.getSource().getDefiningOp<tensor::ExtractSliceOp>();
+  if (auto slice = selection.store.getSource().getDefiningOp<tensor::ExtractSliceOp>();
       slice && slice->getParentOp() != payload)
-    return failure();
-  if (schedule == AccessSchedule::Jagged)
-    for (auto load : metadata)
+    return handoffFailure(reason, "output slice must be local to the payload");
+  if (selection.schedule == AccessSchedule::Jagged)
+    for (auto load : selection.metadata)
       if (load->getParentOp() != func)
-        return failure();
-  if (pointers.size() != s.roles.inputs.size())
-    return failure();
-  func.walk([&](Operation *op) {
-    if (!op->hasAttr("l1_prefetch_ps.padding"))
-      return;
-    auto guard = dyn_cast<scf::IfOp>(op);
-    if (!guard || guard->getParentOp() != payload || guard.getNumResults() ||
-        !guard.getElseRegion().empty() ||
-        std::distance(guard.getThenRegion().front().begin(),
-                      guard.getThenRegion().front().end()) != 2 ||
-        !isa<linalg::FillOp>(guard.getThenRegion().front().front()) ||
-        !isa<scf::YieldOp>(guard.getThenRegion().front().back()))
-      malformed = true;
+        return handoffFailure(
+            reason, "jagged metadata load must be directly inside the function");
+  if (pointers.size() != selection.roles.inputs.size())
+    return handoffFailure(
+        reason, "selected copies do not cover every input role");
+  auto padding = func.walk([&](Operation *op) -> WalkResult {
+    if (op->hasAttr("l1_prefetch_ps.padding") && !isFillOnlyPaddingGuard(op, payload))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
   });
-  if (malformed)
+  if (padding.wasInterrupted())
+    return handoffFailure(
+        reason, "padding guard must contain only a fill and yield in the payload");
+  return success();
+}
+
+FailureOr<Selection> readSelection(func::FuncOp func,
+                                   hivm::l1prefetch::KernelLayout &layout,
+                                   std::string &reason) {
+  Selection selection;
+  if (failed(collectSelection(func, selection, reason)))
     return failure();
-  if (flat && !program) {
-    s.flatBound = dyn_cast<BlockArgument>(s.roles.size);
-    if (!s.flatBound)
-      return failure();
-  } else if (schedule == AccessSchedule::Nested) {
-    s.rowBound = s.roles.rows;
+  auto facts = hivm::l1prefetch::decodeAcceptedFacts(func, layout, &reason);
+  if (failed(facts))
+    return failure();
+  if (facts->schedule != selection.schedule)
+    return handoffFailure(
+        reason, "accepted schedule disagrees with selection markers");
+  selection.roles = facts->roles;
+  // Physical handoff checks consume the proof; they do not recognize eligibility.
+  if (failed(checkLoopNesting(func, selection, reason)) ||
+      failed(checkPayload(func, selection, *facts, reason)))
+    return failure();
+  if (selection.schedule == AccessSchedule::Flat) {
+    selection.flatBound = dyn_cast<BlockArgument>(selection.roles.size);
+    if (!selection.flatBound)
+      return handoffFailure(reason, "flat extent must name a block argument");
+  } else if (selection.schedule == AccessSchedule::Nested) {
+    selection.rowBound = selection.roles.rows;
   }
-  return s;
+  return selection;
 }
 
 } // namespace
@@ -262,13 +348,23 @@ namespace {
 FailureOr<Selection> readAcceptedSelection(func::FuncOp func) {
   auto layout = hivm::l1prefetch::KernelLayout::get(func);
   auto proof = func->getAttrOfType<StringAttr>(kProof);
-  if (func->hasAttrOfType<UnitAttr>("l1_prefetch_ps.accepted") && proof &&
-      proof.getValue() == hivm::l1PrefetchPSFingerprint(func) && layout) {
-    auto selected = readSelection(func, *layout);
+  std::string reason;
+  if (!func->hasAttrOfType<UnitAttr>("l1_prefetch_ps.accepted"))
+    reason = "missing acceptance marker";
+  else if (!proof)
+    reason = "missing proof fingerprint";
+  else if (proof.getValue() != hivm::l1PrefetchPSFingerprint(func))
+    reason = "proof fingerprint does not match the current IR";
+  else if (!layout)
+    reason = "invalid TTAdapter argument layout";
+  else {
+    auto selected = readSelection(func, *layout, reason);
     if (succeeded(selected))
       return selected;
   }
-  func.emitError("L1 pipeline error: missing, stale or inconsistent accepted analysis metadata");
+  func.emitError("L1 pipeline error: missing, stale or inconsistent accepted "
+                 "analysis metadata: ")
+      << reason;
   return failure();
 }
 } // namespace
@@ -277,137 +373,153 @@ LogicalResult mlir::hivm::verifyL1PrefetchPSAcceptance(func::FuncOp func) {
 }
 
 namespace {
-FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func, const Selection &s) {
-  using namespace mlir::hivm;
-  Builder b(func.getContext());
-  NamedAttrList attrs;
-  auto put = [&](StringRef name, int64_t value) {
-    attrs.set(name, b.getI32IntegerAttr(value));
+// These encoders transport proven facts; they do not derive new launch policy.
+bool encodeScalarField(Builder &builder, NamedAttrList &attrs,
+                       StringRef argumentKey, StringRef constantKey,
+                       OpFoldResult source) {
+  auto setI32 = [&](StringRef key, int64_t value) {
+    attrs.set(key, builder.getI32IntegerAttr(value));
   };
-  // Every realization carries the same explicit input-list and output roles.
-  // Selection identity, including bank order, follows public ABI order.
+  if (auto value = dyn_cast<Value>(source)) {
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      setI32(argumentKey, arg.getArgNumber());
+      return true;
+    }
+    auto constant = hivm::l1prefetch::integer(value);
+    if (!constant)
+      return false;
+    setI32(constantKey, *constant);
+  } else {
+    auto integer = dyn_cast<IntegerAttr>(cast<Attribute>(source));
+    if (!integer)
+      return false;
+    setI32(constantKey, integer.getInt());
+  }
+  return true;
+}
+
+FailureOr<IntegerAttr> residentPairStride(func::FuncOp func) {
+  auto target = hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
+  if (!target)
+    return failure();
+  auto spec = hacc::utils::getNPUTargetSpecAttr(func.getContext(), *target,
+                                              func.getLoc());
+  auto cores = spec.getSpecForIdentifierEnum(hacc::DeviceSpec::CUBE_CORE_COUNT);
+  if (!cores || !isa<IntegerAttr>(cores.getValue()))
+    return failure();
+  return cast<IntegerAttr>(cores.getValue());
+}
+
+LogicalResult emitPersistentFields(func::FuncOp func, const Selection &selection,
+                                    Builder &builder, NamedAttrList &attrs) {
+  auto setI32 = [&](StringRef key, int64_t value) {
+    attrs.set(key, builder.getI32IntegerAttr(value));
+  };
+  if (!selection.runtimePersistent) {
+    auto logicalPrograms = *hivm::l1prefetch::integer(selection.logicalPrograms);
+    setI32("logical_programs", logicalPrograms);
+    setI32("physical_programs", logicalPrograms / 2);
+    setI32("persistent_steps", *hivm::l1prefetch::integer(selection.persistentSteps));
+    setI32("row_tasks", *hivm::l1prefetch::integer(selection.rowTasks));
+    return success();
+  }
+  setI32("persistent_runtime", 1);
+  auto layout = hivm::l1prefetch::KernelLayout::get(func);
+  auto encodeCount = [&](StringRef name, Value value) {
+    if (layout)
+      for (unsigned axis = 0; axis < 3; ++axis)
+        if (value == layout->gridDim(axis)) {
+          setI32((name + "_grid").str(), axis);
+          return true;
+        }
+    return encodeScalarField(builder, attrs, (name + "_arg").str(),
+                             ("static_" + name).str(), value);
+  };
+  if (!encodeCount("logical_programs", selection.logicalPrograms) ||
+      !encodeCount("persistent_steps", selection.persistentSteps) ||
+      !encodeCount("row_tasks", selection.rowTasks))
+    return failure();
+  // Persistent's partition theorem requires a static stride/column count.
+  auto stride = getConstantIntValue(selection.roles.stride);
+  if (!stride)
+    return failure();
+  setI32("row_stride", *stride);
+  return success();
+}
+
+FailureOr<DictionaryAttr> getRealizationContract(func::FuncOp func,
+                                                const Selection &selection) {
+  Builder builder(func.getContext());
+  NamedAttrList attrs;
+  auto setI32 = [&](StringRef key, int64_t value) {
+    attrs.set(key, builder.getI32IntegerAttr(value));
+  };
+  auto encodeScalar = [&](StringRef argumentKey, StringRef constantKey,
+                          OpFoldResult source) {
+    return encodeScalarField(builder, attrs, argumentKey, constantKey, source);
+  };
+  // Every realization carries explicit pointers in public ABI (bank) order.
   SmallVector<int32_t> inputs;
-  for (auto arg : s.roles.inputs)
+  for (auto arg : selection.roles.inputs)
     inputs.push_back(arg.getArgNumber());
-  attrs.set("input_args", b.getDenseI32ArrayAttr(inputs));
-  put("output_arg", s.roles.output.getArgNumber());
-  // The access proof already establishes these facts. Validate the emitted
-  // representation too, before it crosses the pristine/lowered ABI boundary.
-  if (failed(verifyL1PrefetchPSRealizationRoles(
+  attrs.set("input_args", builder.getDenseI32ArrayAttr(inputs));
+  setI32("output_arg", selection.roles.output.getArgNumber());
+  if (failed(hivm::verifyL1PrefetchPSRealizationRoles(
           func, attrs.getDictionary(func.getContext()), func)))
     return failure();
-  auto scalar = [&](StringRef argumentKey, StringRef constantKey,
-                    OpFoldResult value) -> bool {
-    if (auto v = dyn_cast<Value>(value)) {
-      if (auto arg = dyn_cast<BlockArgument>(v)) {
-        put(argumentKey, arg.getArgNumber());
-        return true;
-      }
-      auto constant = l1prefetch::integer(v);
-      if (!constant)
-        return false;
-      put(constantKey, *constant);
-    } else {
-      auto integer = dyn_cast<IntegerAttr>(cast<Attribute>(value));
-      if (!integer)
-        return false;
-      put(constantKey, integer.getInt());
+
+  bool flat = selection.schedule == AccessSchedule::Flat;
+  bool program = selection.schedule == AccessSchedule::Program;
+  bool jagged = selection.schedule == AccessSchedule::Jagged;
+  bool fixed = selection.schedule == AccessSchedule::Persistent &&
+               !selection.runtimePersistent;
+  if (!fixed) {
+    if (flat)
+      setI32("tile_elements", selection.tile.getDimSize(0));
+    else {
+      setI32("tile_rows", selection.tile.getDimSize(0));
+      setI32("tile_cols", selection.tile.getDimSize(1));
     }
-    return true;
-  };
-  if (func->hasAttr("l1_prefetch_ps.flat") ||
-      func->hasAttr("l1_prefetch_ps.program")) {
-    auto type = s.tile;
-    bool program = func->hasAttr("l1_prefetch_ps.program");
-    put(program ? "program_tile" : "flat_tile", 1);
-    if (program) {
-      put("tile_rows", type.getDimSize(0));
-      put("tile_cols", type.getDimSize(1));
-    } else {
-      put("tile_elements", type.getDimSize(0));
-      put("size_arg", s.flatBound.getArgNumber());
-    }
-    put("element_bits", type.getElementTypeBitWidth());
-    auto target =
-        hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
-    if (!target)
-      return failure();
-    auto spec = hacc::utils::getNPUTargetSpecAttr(func.getContext(), *target,
-                                                  func.getLoc());
-    auto cores =
-        spec.getSpecForIdentifierEnum(hacc::DeviceSpec::CUBE_CORE_COUNT);
-    if (!cores || !isa<IntegerAttr>(cores.getValue()))
-      return failure();
-    put("pair_stride", cast<IntegerAttr>(cores.getValue()).getInt());
-    return attrs.getDictionary(func.getContext());
+    setI32("element_bits", selection.tile.getElementTypeBitWidth());
   }
-  if (func->hasAttr("l1_prefetch_ps.jagged")) {
-    auto target =
-        hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
-    if (!target)
+  if (flat || program || jagged) {
+    auto stride = residentPairStride(func);
+    if (failed(stride))
       return failure();
-    auto spec = hacc::utils::getNPUTargetSpecAttr(func.getContext(), *target,
-                                                  func.getLoc());
-    auto cores =
-        spec.getSpecForIdentifierEnum(hacc::DeviceSpec::CUBE_CORE_COUNT);
-    if (!cores || !isa<IntegerAttr>(cores.getValue()))
-      return failure();
-    put("pair_stride", cast<IntegerAttr>(cores.getValue()).getInt());
-    put("jagged_copy", 1);
-    put("tile_rows", s.tile.getDimSize(0));
-    put("tile_cols", s.tile.getDimSize(1));
-    put("element_bits", s.tile.getElementTypeBitWidth());
-    put("offsets_arg", s.roles.offsets.getArgNumber());
-    if (!scalar("input_stride_arg", "static_input_stride", s.roles.inputStride) ||
-        !scalar("stride_arg", "row_stride", s.roles.cols) ||
-        !scalar("matrix_stride_arg", "static_matrix_stride", s.roles.matrixStride))
-      return failure();
-    return attrs.getDictionary(func.getContext());
+    setI32("pair_stride", stride->getInt());
   }
-  if (!s.inner) {
-    if (s.runtimePersistent) {
-      put("persistent_runtime", 1);
-      put("tile_rows", s.tile.getDimSize(0));
-      put("tile_cols", s.tile.getDimSize(1));
-      put("element_bits", s.tile.getElementTypeBitWidth());
-      auto layout = l1prefetch::KernelLayout::get(func);
-      auto count = [&](StringRef name, Value value) {
-        if (layout)
-          for (unsigned axis = 0; axis < 3; ++axis)
-            if (value == layout->gridDim(axis)) {
-              put((name + "_grid").str(), axis);
-              return true;
-            }
-        return scalar((name + "_arg").str(), ("static_" + name).str(), value);
-      };
-      if (!count("logical_programs", s.logicalPrograms) ||
-          !count("persistent_steps", s.persistentSteps) ||
-          !count("row_tasks", s.rowTasks))
-        return failure();
-      // Persistent's partition theorem requires a static row stride and column
-      // count. Do not advertise an argument encoding that it cannot support.
-      auto stride = getConstantIntValue(s.roles.stride);
-      if (!stride)
-        return failure();
-      put("row_stride", *stride);
-    } else {
-      put("logical_programs", *l1prefetch::integer(s.logicalPrograms));
-      put("physical_programs", *l1prefetch::integer(s.logicalPrograms) / 2);
-      put("persistent_steps", *l1prefetch::integer(s.persistentSteps));
-      put("row_tasks", *l1prefetch::integer(s.rowTasks));
-    }
-  } else {
-    MemRefType tile = s.tile;
-    put("tile_rows", tile.getDimSize(0));
-    put("tile_cols", tile.getDimSize(1));
-    put("element_bits", tile.getElementTypeBitWidth());
-    if (l1prefetch::nestedTileMode(s.roles, s.tile) ==
-        l1prefetch::NestedTileMode::Partial)
-      put("partial_tiles", 1);
-    if (!scalar("rows_arg", "static_rows", s.rowBound) ||
-        !scalar("cols_arg", "static_cols", s.roles.cols) ||
-        !scalar("stride_arg", "row_stride", s.roles.stride))
+
+  switch (selection.schedule) {
+  case AccessSchedule::Program:
+    setI32("program_tile", 1);
+    break;
+  case AccessSchedule::Flat:
+    setI32("flat_tile", 1);
+    setI32("size_arg", selection.flatBound.getArgNumber());
+    break;
+  case AccessSchedule::Jagged:
+    setI32("jagged_copy", 1);
+    setI32("offsets_arg", selection.roles.offsets.getArgNumber());
+    if (!encodeScalar("input_stride_arg", "static_input_stride",
+                      selection.roles.inputStride) ||
+        !encodeScalar("stride_arg", "row_stride", selection.roles.cols) ||
+        !encodeScalar("matrix_stride_arg", "static_matrix_stride",
+                      selection.roles.matrixStride))
       return failure();
+    break;
+  case AccessSchedule::Persistent:
+    if (failed(emitPersistentFields(func, selection, builder, attrs)))
+      return failure();
+    break;
+  case AccessSchedule::Nested:
+    if (hivm::l1prefetch::nestedTileMode(selection.roles, selection.tile) ==
+        hivm::l1prefetch::NestedTileMode::Partial)
+      setI32("partial_tiles", 1);
+    if (!encodeScalar("rows_arg", "static_rows", selection.rowBound) ||
+        !encodeScalar("cols_arg", "static_cols", selection.roles.cols) ||
+        !encodeScalar("stride_arg", "row_stride", selection.roles.stride))
+      return failure();
+    break;
   }
   return attrs.getDictionary(func.getContext());
 }
@@ -440,7 +552,7 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
   auto selected = readAcceptedSelection(func);
   if (failed(selected))
     return failure();
-  auto &s = *selected;
+  auto &selection = *selected;
   Builder b(func.getContext());
   auto pointerRole = [&](BlockArgument arg) -> DictionaryAttr {
     auto element = cast<MemRefType>(arg.getType()).getElementType();
@@ -465,7 +577,7 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
     if (auto v = dyn_cast<Value>(value)) {
       if (auto arg = dyn_cast<BlockArgument>(v)) {
         auto layout = l1prefetch::KernelLayout::get(func);
-        if (s.runtimePersistent && layout)
+        if (selection.runtimePersistent && layout)
           for (unsigned axis = 0; axis < 3; ++axis)
             if (v == layout->gridDim(axis))
               return b.getDictionaryAttr({
@@ -488,14 +600,14 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
   };
   NamedAttrList roles, launch, guard, tile;
   SmallVector<Attribute> inputs;
-  for (auto input : s.roles.inputs) {
+  for (auto input : selection.roles.inputs) {
     auto role = pointerRole(input);
     if (!role)
       return failure();
     inputs.push_back(role);
   }
   roles.set("inputs", b.getArrayAttr(inputs));
-  auto output = pointerRole(s.roles.output);
+  auto output = pointerRole(selection.roles.output);
   if (!output)
     return failure();
   roles.set("output", output);
@@ -509,8 +621,8 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
   const bool flat = func->hasAttr("l1_prefetch_ps.flat");
   const bool program = func->hasAttr("l1_prefetch_ps.program");
   const bool jagged = func->hasAttr("l1_prefetch_ps.jagged");
-  const bool persistent = !flat && !program && !jagged && !s.inner;
-  const bool fixed = persistent && !s.runtimePersistent;
+  const bool persistent = !flat && !program && !jagged && !selection.inner;
+  const bool fixed = persistent && !selection.runtimePersistent;
   StringRef distribution = fixed ? "fixed"
                                  : flat || program || jagged ? "resident_pairs" : "half_grid";
   launch.set("distribution", b.getStringAttr(distribution));
@@ -518,21 +630,17 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
   if (program)
     launch.set("logical_grid", b.getStringAttr("xyz"));
   if (fixed) {
-    launch.set("logical_programs", b.getI32IntegerAttr(*l1prefetch::integer(s.logicalPrograms)));
+    launch.set("logical_programs", b.getI32IntegerAttr(
+        *l1prefetch::integer(selection.logicalPrograms)));
   } else if (flat || program || jagged) {
-    auto target = hacc::utils::getTargetDevice(func->getParentOfType<ModuleOp>());
-    if (!target)
+    auto stride = residentPairStride(func);
+    if (failed(stride))
       return failure();
-    auto spec = hacc::utils::getNPUTargetSpecAttr(func.getContext(), *target,
-                                                func.getLoc());
-    auto cores = spec.getSpecForIdentifierEnum(hacc::DeviceSpec::CUBE_CORE_COUNT);
-    if (!cores || !isa<IntegerAttr>(cores.getValue()))
-      return failure();
-    launch.set("resident_stride", cores.getValue());
+    launch.set("resident_stride", *stride);
   }
   if (program) {
     SmallVector<Attribute> strides;
-    for (auto stride : s.roles.inputStrides) {
+    for (auto stride : selection.roles.inputStrides) {
       auto role = scalarRole(stride);
       if (!role)
         return failure();
@@ -540,35 +648,36 @@ mlir::hivm::getL1PrefetchPSExternalContract(func::FuncOp func) {
     }
     roles.set("input_strides", b.getArrayAttr(strides));
   } else if (flat) {
-    if (!addScalar("size", s.roles.size))
+    if (!addScalar("size", selection.roles.size))
       return failure();
   } else if (jagged) {
-    auto offsets = pointerRole(s.roles.offsets);
-    if (!offsets || !addScalar("input_stride", s.roles.inputStride) ||
-        !addScalar("stride", s.roles.cols) ||
-        !addScalar("matrix_stride", s.roles.matrixStride))
+    auto offsets = pointerRole(selection.roles.offsets);
+    if (!offsets || !addScalar("input_stride", selection.roles.inputStride) ||
+        !addScalar("stride", selection.roles.cols) ||
+        !addScalar("matrix_stride", selection.roles.matrixStride))
       return failure();
     roles.set("offsets", offsets);
-  } else if (s.runtimePersistent) {
-    if (!addScalar("logical_programs", s.logicalPrograms) ||
-        !addScalar("persistent_steps", s.persistentSteps) ||
-        !addScalar("row_tasks", s.rowTasks) ||
-        !addScalar("stride", s.roles.stride))
+  } else if (selection.runtimePersistent) {
+    if (!addScalar("logical_programs", selection.logicalPrograms) ||
+        !addScalar("persistent_steps", selection.persistentSteps) ||
+        !addScalar("row_tasks", selection.rowTasks) ||
+        !addScalar("stride", selection.roles.stride))
       return failure();
   } else if (!fixed) {
-    if (!addScalar("rows", s.roles.rows) || !addScalar("cols", s.roles.cols) ||
-        !addScalar("stride", s.roles.stride))
+    if (!addScalar("rows", selection.roles.rows) ||
+        !addScalar("cols", selection.roles.cols) ||
+        !addScalar("stride", selection.roles.stride))
       return failure();
   }
-  tile.set("rows", b.getI64IntegerAttr(flat ? 1 : s.tile.getDimSize(0)));
-  tile.set("cols", b.getI64IntegerAttr(s.tile.getDimSize(flat ? 0 : 1)));
-  tile.set("element_bits", b.getI32IntegerAttr(s.tile.getElementTypeBitWidth()));
-  StringRef kind = s.runtimePersistent ? "persistent_tiles" : fixed ? "fixed_programs"
+  tile.set("rows", b.getI64IntegerAttr(flat ? 1 : selection.tile.getDimSize(0)));
+  tile.set("cols", b.getI64IntegerAttr(selection.tile.getDimSize(flat ? 0 : 1)));
+  tile.set("element_bits", b.getI32IntegerAttr(selection.tile.getElementTypeBitWidth()));
+  StringRef kind = selection.runtimePersistent ? "persistent_tiles" : fixed ? "fixed_programs"
                          : program ? "program_tiles" : flat ? "flat_tiles"
                                 : jagged ? "metadata_bounded_tiles" : "tiles_2d";
   guard.set("kind", b.getStringAttr(kind));
   bool partial = flat || program || jagged ||
-                 (!persistent && l1prefetch::nestedTileMode(s.roles, s.tile) ==
+                 (!persistent && l1prefetch::nestedTileMode(selection.roles, selection.tile) ==
                                 l1prefetch::NestedTileMode::Partial);
   guard.set("tile_mode", b.getStringAttr(partial ? "partial" : "full"));
   guard.set("tile", tile.getDictionary(func.getContext()));
@@ -584,7 +693,7 @@ namespace {
 // one-tile programs; the materializer owns the shared prefetch/buffering
 // schedule.
 void normalizeFlat(func::FuncOp func, hivm::l1prefetch::KernelLayout &layout,
-                   Selection s, DictionaryAttr contract) {
+                   Selection selection, DictionaryAttr contract) {
   IRRewriter b(func.getContext());
   Location loc = func.getLoc();
   SmallVector<Operation *> original;
@@ -610,7 +719,7 @@ void normalizeFlat(func::FuncOp func, hivm::l1prefetch::KernelLayout &layout,
     Value widePid = b.create<arith::ExtSIOp>(loc, b.getI64Type(), pid);
     Value offset = b.create<arith::MulIOp>(loc, widePid, width);
     Value inGrid = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, pid, grid);
-    Value wideSize = b.create<arith::ExtSIOp>(loc, b.getI64Type(), s.roles.size);
+    Value wideSize = b.create<arith::ExtSIOp>(loc, b.getI64Type(), selection.roles.size);
     Value inRange = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, offset, wideSize);
     active = b.create<arith::AndIOp>(loc, inGrid, inRange);
   }
@@ -629,7 +738,7 @@ void normalizeFlat(func::FuncOp func, hivm::l1prefetch::KernelLayout &layout,
           hivm::PadModeAttr::get(func.getContext(), hivm::PadMode::PadNull),
           Value{});
     } else {
-      bool selectedView = llvm::any_of(s.loads, [&](memref::CopyOp copy) {
+      bool selectedView = llvm::any_of(selection.loads, [&](memref::CopyOp copy) {
         return copy.getTarget().getDefiningOp() == op;
       });
       if (!selectedView)
@@ -643,9 +752,9 @@ void normalizeFlat(func::FuncOp func, hivm::l1prefetch::KernelLayout &layout,
 // All rounds are bounded by the dense destination, independently of the two
 // sequence lengths. Empty/truncated rows retain the original output padding.
 // Payload predicates can differ; synchronization participation must not.
-void normalizeJagged(func::FuncOp func, Selection s) {
+void normalizeJagged(func::FuncOp func, Selection selection) {
   IRRewriter b(func.getContext());
-  Location loc = s.outer.getLoc();
+  Location loc = selection.outer.getLoc();
   Value rows;
   func.walk([&](arith::MinSIOp op) {
     if (op->hasAttr("l1_prefetch_ps.rows"))
@@ -655,10 +764,10 @@ void normalizeJagged(func::FuncOp func, Selection s) {
     if (op->hasAttr("l1_prefetch_ps.metadata"))
       op->setAttr("program_split.metadata", b.getUnitAttr());
   });
-  b.setInsertionPoint(s.outer);
+  b.setInsertionPoint(selection.outer);
   Value zero = b.create<arith::ConstantIntOp>(loc, 0, 32);
   Value one = b.create<arith::ConstantIntOp>(loc, 1, 32);
-  auto type = s.tile;
+  auto type = selection.tile;
   Value bm = b.create<arith::ConstantIntOp>(loc, type.getDimSize(0), 32);
   Value bn = b.create<arith::ConstantIntOp>(loc, type.getDimSize(1), 32);
   Value rowPad =
@@ -666,9 +775,9 @@ void normalizeJagged(func::FuncOp func, Selection s) {
   Value colPad =
       b.create<arith::ConstantIntOp>(loc, type.getDimSize(1) - 1, 32);
   Value denseRows =
-      b.create<arith::DivSIOp>(loc, s.roles.matrixStride, s.roles.cols);
+      b.create<arith::DivSIOp>(loc, selection.roles.matrixStride, selection.roles.cols);
   Value columns = b.create<arith::DivSIOp>(
-      loc, b.create<arith::AddIOp>(loc, s.inner.getUpperBound(), colPad), bn);
+      loc, b.create<arith::AddIOp>(loc, selection.inner.getUpperBound(), colPad), bn);
   Value rowTiles = b.create<arith::DivSIOp>(
       loc, b.create<arith::AddIOp>(loc, denseRows, rowPad), bm);
   Value steps = b.create<arith::MulIOp>(loc, rowTiles, columns);
@@ -690,21 +799,21 @@ void normalizeJagged(func::FuncOp func, Selection s) {
   IRMapping mapping;
   Value rowIndex = b.create<arith::IndexCastOp>(loc, b.getIndexType(), row);
   Value colIndex = b.create<arith::IndexCastOp>(loc, b.getIndexType(), col);
-  mapping.map(s.outer.getRegionIterArgs()[0], rowIndex);
-  mapping.map(s.outer.getInductionVar(),
-              b.create<arith::AddIOp>(loc, s.outer.getLowerBound(), row64));
-  mapping.map(s.inner.getInductionVar(), col);
-  mapping.map(s.inner.getRegionIterArgs()[0], colIndex);
-  for (Operation &op : s.outer.getBody()->without_terminator())
-    if (&op != s.inner.getOperation())
+  mapping.map(selection.outer.getRegionIterArgs()[0], rowIndex);
+  mapping.map(selection.outer.getInductionVar(),
+              b.create<arith::AddIOp>(loc, selection.outer.getLowerBound(), row64));
+  mapping.map(selection.inner.getInductionVar(), col);
+  mapping.map(selection.inner.getRegionIterArgs()[0], colIndex);
+  for (Operation &op : selection.outer.getBody()->without_terminator())
+    if (&op != selection.inner.getOperation())
       b.clone(op, mapping);
   mapping.map(
-      s.inner.getRegionIterArgs()[1],
+      selection.inner.getRegionIterArgs()[1],
       b.create<arith::AddIOp>(
-          loc, mapping.lookupOrDefault(s.inner.getInitArgs()[1]), colIndex));
-  auto load = s.loads.front();
+          loc, mapping.lookupOrDefault(selection.inner.getInitArgs()[1]), colIndex));
+  auto load = selection.loads.front();
   auto dst = load.getTarget().getDefiningOp<memref::SubViewOp>();
-  for (Operation &op : s.inner.getBody()->without_terminator()) {
+  for (Operation &op : selection.inner.getBody()->without_terminator()) {
     if (op.hasAttr("l1_prefetch_ps.padding") || &op == dst.getOperation())
       continue;
     if (&op == load.getOperation()) {
@@ -716,27 +825,27 @@ void normalizeJagged(func::FuncOp func, Selection s) {
     } else
       b.clone(op, mapping);
   }
-  b.eraseOp(s.outer);
+  b.eraseOp(selection.outer);
 }
 
-void normalizeNested(func::FuncOp func, Selection s) {
+void normalizeNested(func::FuncOp func, Selection selection) {
   IRRewriter b(func.getContext());
-  Location loc = s.outer.getLoc();
-  b.setInsertionPoint(s.outer);
-  auto tile = s.tile;
+  Location loc = selection.outer.getLoc();
+  b.setInsertionPoint(selection.outer);
+  auto tile = selection.tile;
   Value zero = b.create<arith::ConstantIntOp>(loc, 0, 32);
   Value one = b.create<arith::ConstantIntOp>(loc, 1, 32);
   Value bm = b.create<arith::ConstantIntOp>(loc, tile.getDimSize(0), 32);
   Value bn = b.create<arith::ConstantIntOp>(loc, tile.getDimSize(1), 32);
-  Value grid = s.outer.getStep(), pid = s.outer.getLowerBound();
-  bool partialTiles = hivm::l1prefetch::nestedTileMode(s.roles, s.tile) ==
+  Value grid = selection.outer.getStep(), pid = selection.outer.getLowerBound();
+  bool partialTiles = hivm::l1prefetch::nestedTileMode(selection.roles, selection.tile) ==
                       hivm::l1prefetch::NestedTileMode::Partial;
-  Value rowBound = s.rowBound;
+  Value rowBound = selection.rowBound;
   if (auto constant = hivm::l1prefetch::integer(rowBound))
     rowBound = b.create<arith::ConstantIntOp>(loc, *constant, 32);
-  Value tasks = partialTiles ? s.outer.getUpperBound()
+  Value tasks = partialTiles ? selection.outer.getUpperBound()
                              : b.create<arith::DivSIOp>(loc, rowBound, bm);
-  Value columnEnd = s.inner.getUpperBound();
+  Value columnEnd = selection.inner.getUpperBound();
   if (partialTiles)
     columnEnd = b.create<arith::SubIOp>(
         loc, b.create<arith::AddIOp>(loc, columnEnd, bn), one);
@@ -761,15 +870,15 @@ void normalizeNested(func::FuncOp func, Selection s) {
   auto work = b.create<scf::IfOp>(loc, active, false);
   b.setInsertionPointToStart(&work.getThenRegion().front());
   IRMapping mapping;
-  mapping.map(s.outer.getInductionVar(), row);
-  mapping.map(s.inner.getInductionVar(), offset);
-  for (Operation &op : s.outer.getBody()->without_terminator())
-    if (&op != s.inner.getOperation())
+  mapping.map(selection.outer.getInductionVar(), row);
+  mapping.map(selection.inner.getInductionVar(), offset);
+  for (Operation &op : selection.outer.getBody()->without_terminator())
+    if (&op != selection.inner.getOperation())
       b.clone(op, mapping);
-  for (Operation &op : s.inner.getBody()->without_terminator()) {
+  for (Operation &op : selection.inner.getBody()->without_terminator()) {
     if (op.hasAttr("l1_prefetch_ps.padding"))
       continue;
-    if (partialTiles && llvm::any_of(s.loads, [&](auto load) {
+    if (partialTiles && llvm::any_of(selection.loads, [&](auto load) {
           return &op == load.getTarget().getDefiningOp();
         }))
       continue;
@@ -778,10 +887,10 @@ void normalizeNested(func::FuncOp func, Selection s) {
       mapping.map(op.getResult(0), mapping.lookupOrDefault(op.getOperand(0)));
       continue;
     }
-    auto selected = llvm::find_if(s.loads, [&](auto load) {
+    auto selected = llvm::find_if(selection.loads, [&](auto load) {
       return &op == load.getOperation();
     });
-    if (partialTiles && selected != s.loads.end()) {
+    if (partialTiles && selected != selection.loads.end()) {
       // Preserve the proved GM extent. The allocated tile remains the physical
       // destination. Per-input padding independence proves that unused edges
       // are unobservable; no fill is needed on cube-side L1 or vector-side UB.
@@ -796,7 +905,7 @@ void normalizeNested(func::FuncOp func, Selection s) {
     }
     b.clone(op, mapping);
   }
-  b.eraseOp(s.outer);
+  b.eraseOp(selection.outer);
 }
 
 struct L1PrefetchNormalizePass
@@ -817,7 +926,7 @@ struct L1PrefetchNormalizePass
     auto layout = hivm::l1prefetch::KernelLayout::get(func);
     if (!layout)
       return signalPassFailure();
-    Selection s = *selection;
+    Selection accepted = *selection;
     // Every accepted launcher checks positive grid dimensions and a bounded
     // grid product. Preserve their verified ABI identities through ID lowering.
     for (unsigned axis = 0; axis < 3; ++axis)
@@ -826,11 +935,11 @@ struct L1PrefetchNormalizePass
                       IntegerAttr::get(IntegerType::get(module.getContext(), 32), axis));
     if (func->hasAttr("l1_prefetch_ps.flat") ||
         func->hasAttr("l1_prefetch_ps.program"))
-      normalizeFlat(func, *layout, s, *contract);
+      normalizeFlat(func, *layout, accepted, *contract);
     else if (func->hasAttr("l1_prefetch_ps.jagged"))
-      normalizeJagged(func, s);
-    else if (s.inner)
-      normalizeNested(func, s);
+      normalizeJagged(func, accepted);
+    else if (accepted.inner)
+      normalizeNested(func, accepted);
     // Retire proof annotations; normal lowering changes their premises. The
     // selected-input value mark remains until physical staging consumes it.
     func.walk([&](Operation *op) {

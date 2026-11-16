@@ -4,7 +4,9 @@
 
 #include "L1PrefetchPSRoles.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/Twine.h"
 #include <limits>
+#include <string>
 
 namespace mlir::hivm::l1prefetch {
 constexpr StringLiteral kAcceptedFacts = "l1_prefetch_ps.facts";
@@ -130,27 +132,38 @@ inline LogicalResult publishAcceptedFacts(func::FuncOp func,
 }
 
 inline FailureOr<AcceptedFacts> decodeAcceptedFacts(func::FuncOp func,
-                                                    KernelLayout &layout) {
+                                                    KernelLayout &layout,
+                                                    std::string *reason = nullptr) {
+  // Preserve the first cause; the caller emits one pipeline-error diagnostic.
+  auto reject = [&](const Twine &message) -> LogicalResult {
+    if (reason && reason->empty())
+      *reason = message.str();
+    return failure();
+  };
   auto fields = func->getAttrOfType<DictionaryAttr>(kAcceptedFacts);
   if (!fields)
-    return failure();
+    return reject("missing accepted-facts dictionary");
   auto version = fields.getAs<IntegerAttr>("version");
   auto kind = fields.getAs<IntegerAttr>("schedule");
   auto inputs = fields.getAs<DenseI32ArrayAttr>("inputs");
   if (!version || !version.getType().isInteger(32) || version.getInt() != 1 ||
       !kind || !kind.getType().isInteger(32) || kind.getInt() < 0 ||
       kind.getInt() > int(AccessSchedule::Program) || !inputs || inputs.empty())
-    return failure();
+    return reject("invalid accepted-facts version, schedule or input list");
   AcceptedFacts facts{AccessSchedule(kind.getInt()), {}, {}, {}, {}};
   llvm::StringMap<Value> results;
   bool malformed = false;
+  auto invalid = [&](const Twine &message) {
+    malformed = true;
+    (void)reject(message);
+  };
   func.walk([&](Operation *op) {
     auto attr = op->getAttr(kValueRoles);
     if (!attr)
       return;
     auto ids = dyn_cast<DictionaryAttr>(attr);
     if (!ids) {
-      malformed = true;
+      invalid("value-role IDs must form a dictionary");
       return;
     }
     for (auto id : ids) {
@@ -159,11 +172,11 @@ inline FailureOr<AcceptedFacts> decodeAcceptedFacts(func::FuncOp func,
           uint64_t(index.getInt()) >= op->getNumResults() ||
           !results.try_emplace(id.getName().strref(),
                                op->getResult(index.getInt())).second)
-        malformed = true;
+        invalid("value-role ID has an invalid result index or duplicate name");
     }
   });
   llvm::SmallDenseSet<StringRef> used;
-  auto decode = [&](Attribute attr) -> OpFoldResult {
+  auto decodeReference = [&](Attribute attr) -> OpFoldResult {
     auto ref = dyn_cast_or_null<DictionaryAttr>(attr);
     if (!ref || ref.size() != 1)
       return {};
@@ -184,8 +197,8 @@ inline FailureOr<AcceptedFacts> decodeAcceptedFacts(func::FuncOp func,
     }
     return {};
   };
-  auto value = [&](StringRef name) -> Value {
-    return dyn_cast_if_present<Value>(decode(fields.get(name)));
+  auto decodeValue = [&](StringRef name) -> Value {
+    return dyn_cast_if_present<Value>(decodeReference(fields.get(name)));
   };
   auto pointer = [&](Value v) -> BlockArgument {
     auto arg = dyn_cast_or_null<BlockArgument>(v);
@@ -196,77 +209,90 @@ inline FailureOr<AcceptedFacts> decodeAcceptedFacts(func::FuncOp func,
   int32_t previous = -1;
   for (int32_t index : inputs.asArrayRef()) {
     if (index <= previous || index < 0 || unsigned(index) >= func.getNumArguments())
-      return failure();
+      return reject("input role indices must be ordered, distinct and in range");
     auto arg = pointer(func.getArgument(index));
     if (!arg)
-      return failure();
+      return reject("input role must name a public rank-one dynamic memref");
     facts.roles.inputs.push_back(arg);
     previous = index;
   }
-  facts.roles.output = pointer(value("output"));
+  facts.roles.output = pointer(decodeValue("output"));
   if (!facts.roles.output || llvm::is_contained(facts.roles.inputs, facts.roles.output))
-    return failure();
+    return reject("output role must name a distinct public rank-one dynamic memref");
   auto required = acceptedFactFields(facts.schedule);
-  auto scalar = [&](StringRef name, Value &dst) {
-    dst = value(name);
-    malformed |= !dst || !dst.getType().isInteger(32);
+  auto decodeScalar = [&](StringRef name, Value &dst) {
+    dst = decodeValue(name);
+    if (!dst || !dst.getType().isInteger(32))
+      invalid("accepted fact " + name + " must reference an i32 value");
   };
-  auto stride = [&](StringRef name, OpFoldResult &dst) {
-    dst = decode(fields.get(name));
-    if (auto v = dyn_cast_if_present<Value>(dst))
-      malformed |= !v.getType().isIntOrIndex();
-    else if (auto a = dyn_cast_if_present<Attribute>(dst))
-      malformed |= !isa<IntegerAttr>(a);
-    else
-      malformed = true;
+  auto decodeStride = [&](StringRef name, OpFoldResult &dst) {
+    dst = decodeReference(fields.get(name));
+    bool valid = false;
+    if (auto value = dyn_cast_if_present<Value>(dst))
+      valid = value.getType().isIntOrIndex();
+    else if (auto attr = dyn_cast_if_present<Attribute>(dst))
+      valid = isa<IntegerAttr>(attr);
+    if (!valid)
+      invalid("accepted fact " + name + " must reference an integer stride");
   };
   switch (facts.schedule) {
   case AccessSchedule::Persistent:
-    stride("stride", facts.roles.stride);
-    scalar("logical_programs", facts.logicalPrograms);
-    scalar("persistent_steps", facts.persistentSteps);
-    scalar("row_tasks", facts.rowTasks);
-    malformed |= !persistentCountSource(facts.logicalPrograms, layout) ||
-                 !persistentCountSource(facts.persistentSteps, layout) ||
-                 !persistentCountSource(facts.rowTasks, layout) ||
-                 !getConstantIntValue(facts.roles.stride);
+    decodeStride("stride", facts.roles.stride);
+    decodeScalar("logical_programs", facts.logicalPrograms);
+    decodeScalar("persistent_steps", facts.persistentSteps);
+    decodeScalar("row_tasks", facts.rowTasks);
+    if (!persistentCountSource(facts.logicalPrograms, layout) ||
+        !persistentCountSource(facts.persistentSteps, layout) ||
+        !persistentCountSource(facts.rowTasks, layout))
+      invalid("persistent counts must use positive constants, public scalars "
+              "or grid dimensions");
+    if (!getConstantIntValue(facts.roles.stride))
+      invalid("persistent stride must be constant");
     break;
   case AccessSchedule::Nested:
-    scalar("rows", facts.roles.rows);
-    scalar("cols", facts.roles.cols);
-    stride("stride", facts.roles.stride);
+    decodeScalar("rows", facts.roles.rows);
+    decodeScalar("cols", facts.roles.cols);
+    decodeStride("stride", facts.roles.stride);
     break;
   case AccessSchedule::Flat:
-    scalar("size", facts.roles.size);
+    decodeScalar("size", facts.roles.size);
     break;
   case AccessSchedule::Jagged:
-    facts.roles.offsets = pointer(value("offsets"));
-    malformed |= !facts.roles.offsets || facts.roles.offsets == facts.roles.output ||
-                 llvm::is_contained(facts.roles.inputs, facts.roles.offsets);
-    scalar("cols", facts.roles.cols);
-    scalar("input_stride", facts.roles.inputStride);
-    scalar("matrix_stride", facts.roles.matrixStride);
-    stride("stride", facts.roles.stride);
+    facts.roles.offsets = pointer(decodeValue("offsets"));
+    if (!facts.roles.offsets || facts.roles.offsets == facts.roles.output ||
+        llvm::is_contained(facts.roles.inputs, facts.roles.offsets))
+      invalid("jagged offsets must name a distinct public pointer role");
+    decodeScalar("cols", facts.roles.cols);
+    decodeScalar("input_stride", facts.roles.inputStride);
+    decodeScalar("matrix_stride", facts.roles.matrixStride);
+    decodeStride("stride", facts.roles.stride);
     break;
   case AccessSchedule::Program:
     if (auto strides = fields.getAs<ArrayAttr>("input_strides")) {
       for (auto source : strides) {
-        auto ref = decode(source);
+        auto ref = decodeReference(source);
         if (!ref || (isa<Value>(ref) && !cast<Value>(ref).getType().isIntOrIndex()) ||
             (isa<Attribute>(ref) && !isa<IntegerAttr>(cast<Attribute>(ref))))
-          return failure();
+          return reject("program input stride must reference an integer value "
+                        "or literal");
         facts.roles.inputStrides.push_back(ref);
       }
     }
-    malformed |= facts.roles.inputStrides.size() != facts.roles.inputs.size();
+    if (facts.roles.inputStrides.size() != facts.roles.inputs.size())
+      invalid("program input stride count must match the input list");
     break;
   }
-  if (malformed || used.size() != results.size() || fields.size() != required.size())
-    return failure();
+  if (malformed)
+    return failure(); // invalid() recorded the specific field/ID error.
+  if (used.size() != results.size())
+    return reject("unreferenced value-role ID in accepted facts");
+  if (fields.size() != required.size())
+    return reject("accepted fact field count disagrees with the schedule");
   for (auto name : required)
     if (!fields.contains(name))
-      return failure();
+      return reject("missing accepted fact " + name);
   return facts;
 }
+
 } // namespace mlir::hivm::l1prefetch
 #endif

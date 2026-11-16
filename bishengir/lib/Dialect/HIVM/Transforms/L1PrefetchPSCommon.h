@@ -296,6 +296,25 @@ inline Value tileExtentBound(Value size) {
   return value;
 }
 
+// The operation-level rule is separate from reachability and bounded-output
+// checks below. No cross-element computation may observe discarded padding.
+inline bool isPaddingIndependentElementwise(Operation *op,
+                                            RankedTensorType tile) {
+  bool mappedTanh = isMappedTanh(dyn_cast<linalg::MapOp>(op));
+  if (op->getNumResults() != 1 || !isMemoryEffectFree(op) ||
+      (!mappedTanh && (op->getNumRegions() ||
+                      !op->hasTrait<OpTrait::Elementwise>() ||
+                      !isSpeculatable(op))))
+    return false;
+  auto sameShapeFloat = [&](Type type) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    return tensor && tensor.getShape() == tile.getShape() &&
+           isa<FloatType>(tensor.getElementType());
+  };
+  return llvm::all_of(op->getOperandTypes(), sameShapeFloat) &&
+         sameShapeFloat(op->getResult(0).getType());
+}
+
 // Padding is unobservable only when the selected tensor reaches the already
 // proved bounded output slice through same-shape, pure floating-point
 // elementwise operations. Reject any cross-element, integer-conversion or
@@ -322,22 +341,8 @@ inline bool hasUnobservablePadding(
       }
       if (!seen.insert(user).second)
         continue;
-      bool mappedTanh = isMappedTanh(dyn_cast<linalg::MapOp>(user));
       if (user->getParentOp() != parent ||
-          user->getNumResults() != 1 || !isMemoryEffectFree(user) ||
-          (!mappedTanh && (user->getNumRegions() ||
-                          !user->hasTrait<OpTrait::Elementwise>() ||
-                          !isSpeculatable(user))))
-        return false;
-      for (Value operand : user->getOperands()) {
-        auto type = dyn_cast<RankedTensorType>(operand.getType());
-        if (!type || type.getShape() != tile.getShape() ||
-            !isa<FloatType>(type.getElementType()))
-          return false;
-      }
-      auto result = dyn_cast<RankedTensorType>(user->getResult(0).getType());
-      if (!result || result.getShape() != tile.getShape() ||
-          !isa<FloatType>(result.getElementType()))
+          !isPaddingIndependentElementwise(user, tile))
         return false;
       pending.push_back(user->getResult(0));
     }
